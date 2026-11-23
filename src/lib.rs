@@ -4,6 +4,7 @@ pub mod abstract_eval;
 pub mod gauntlet;
 pub mod lint_rs;
 pub mod ntf1;
+pub mod rust_fe;
 pub mod simd_fuzz;
 
 use std::path::Path;
@@ -13,10 +14,17 @@ pub use abstract_eval::{
     ProofStatus, RegBudget, ScheduleReport, VerifyError,
 };
 pub use gauntlet::{build_quad_mod16_kernel, run_gauntlet, AutopoieticLedger, GauntletSummary};
-pub use lint_rs::{scan_crate_dir, scan_rust_source, LintFinding, LintKind, LintReport, Severity};
+pub use lint_rs::{
+    promote_kernel_strict, scan_crate_dir, scan_rust_source, LintFinding, LintKind, LintReport,
+    Severity,
+};
 pub use ntf1::{
     check_svo_tax, emit_ntf1, parse_ntf1, verify_ntf1_file, verify_ntf1_source, Ntf1Doc, Ntf1Error,
     Ntf1Kind, Ntf1Report, Ntf1Stmt,
+};
+pub use rust_fe::{
+    parse_rust_programs, verify_crate_functions, verify_rust_functions, ParsedRustUnit,
+    RustFnFailure, RustProofReport,
 };
 pub use simd_fuzz::{
     eval_lanes_x8, fault_name, format_box_invariant, prove_exhaustive, refine_and_fuzz,
@@ -67,3 +75,15 @@ pub fn verify_crate_dir(dir: &Path) -> Result<LintReport, VerifyError> { require
 
 /// Fail-closed static Rust lint gate over an in-memory Rust source file.
 pub fn verify_rust_source(file: &str, src: &str) -> Result<LintReport, VerifyError> { require_clean(scan_rust_source(file, src)) }
+
+/// Fail-closed kernel-strict Rust gate: promotes panic calls to hard errors and proves all kernel functions.
+pub fn verify_kernel_rust_source(
+    file: &str, src: &str, profile: ArchProfile, cfg: RefineConfig,
+) -> Result<(LintReport, RustProofReport), VerifyError> {
+    let mut lint = scan_rust_source(file, src);
+    promote_kernel_strict(&mut lint);
+    let lint = require_clean(lint)?;
+    let proofs = verify_rust_functions(file, src, profile, cfg);
+    if let Some(first) = proofs.failed.first() { return Err(first.error.clone()); }
+    Ok((lint, proofs))
+}

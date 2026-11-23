@@ -16,7 +16,7 @@ pub enum Severity { Error, Warning }
 pub enum LintKind {
     UnsafeBlock, RawPtrProvenance, Transmute, UncheckedIndex, UninitAccess, ClampCall,
     AllowAttr, ExpectAttr, UnfinishedMacro, ShiftOverflow, DivByZero, NonAscii, UnguardedIndex,
-    UnusedProp,
+    UnusedProp, PanicCall,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -165,6 +165,10 @@ impl<'a> ScanCtx<'a> {
             "clamp" if matches!(prev_non_ws(b, start), Some((_, b'.'))) || matches!(prev_non_ws(b, start), Some((c, b':')) if matches!(prev_non_ws(b, c), Some((_, b':')))) => if matches!(next_non_ws(b, end), Some((_, b'('))) { self.push(line_no, start, Severity::Error, LintKind::ClampCall, raw); },
             "allow" if is_attr_prefix(b, start) && matches!(next_non_ws(b, end), Some((_, b'('))) => self.push(line_no, start, Severity::Error, LintKind::AllowAttr, raw),
             "expect" if is_attr_prefix(b, start) && matches!(next_non_ws(b, end), Some((_, b'('))) => self.push(line_no, start, Severity::Error, LintKind::ExpectAttr, raw),
+            "unwrap" | "expect" if matches!(prev_non_ws(b, start), Some((_, b'.'))) && matches!(next_non_ws(b, end), Some((_, b'('))) => self.push(line_no, start, Severity::Warning, LintKind::PanicCall, raw),
+            "panic" | "unreachable" => if let Some((bang, b'!')) = next_non_ws(b, end) {
+                if matches!(next_non_ws(b, bang + 1), Some((_, b'('))) { self.push(line_no, start, Severity::Warning, LintKind::PanicCall, raw); }
+            },
             "todo" | "unimplemented" => if let Some((bang, b'!')) = next_non_ws(b, end) {
                 if matches!(next_non_ws(b, bang + 1), Some((_, b'('))) { self.push(line_no, start, Severity::Error, LintKind::UnfinishedMacro, raw); }
             },
@@ -271,7 +275,8 @@ fn scan_unused_props(raw_lines: &[&str], mlines: &[&str], ctx: &mut ScanCtx<'_>)
     LintReport { files_scanned: 1, lines_scanned: raw_lines.len(), bytes_scanned: src.len(), elapsed_us: clock_us(t0), findings: ctx.out }
 }
 
-fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), VerifyError> {
+pub(crate) fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), VerifyError> {
+    if dir.is_file() { out.push(dir.to_path_buf()); return Ok(()); }
     for entry in fs::read_dir(dir).map_err(|e| VerifyError::Io(format!("{}: {e}", dir.display())))? {
         let path = entry.map_err(|e| VerifyError::Io(e.to_string()))?.path();
         let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
@@ -281,11 +286,18 @@ fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), VerifyErro
     Ok(())
 }
 
+/// Promote kernel-mode panic hazards (`LintKind::PanicCall`) from Warning to hard Error.
+pub fn promote_kernel_strict(report: &mut LintReport) {
+    for f in &mut report.findings {
+        if f.kind == LintKind::PanicCall { f.severity = Severity::Error; }
+    }
+}
+
 /// Recursively scan all `.rs` files under `dir` (or a single `.rs` file) deterministically.
 pub fn scan_crate_dir(dir: &Path) -> Result<LintReport, VerifyError> {
     let t0 = clock_start();
     let mut files = Vec::new();
-    if dir.is_file() { files.push(dir.to_path_buf()); } else { collect_rs_files(dir, &mut files)?; }
+    collect_rs_files(dir, &mut files)?;
     files.sort();
     let mut report = LintReport::default();
     for path in files {

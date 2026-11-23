@@ -307,7 +307,7 @@ impl Domain {
         if let (Some(a), Some(b)) = (self.is_const(), rhs.is_const()) {
             return Self::exact(match kind { 0 => a & b, 1 => a | b, _ => a ^ b });
         }
-        if kind == 0 && self.is_nonneg() && rhs.is_nonneg() { return Self::range(0, self.hi.min(rhs.hi)); }
+        if kind == 0 { return match (self.is_nonneg(), rhs.is_nonneg()) { (true, true) => Self::range(0, self.hi.min(rhs.hi)), (false, true) => Self::range(0, rhs.hi), (true, false) => Self::range(0, self.hi), _ => Self::top() }; }
         if self.is_nonneg() && rhs.is_nonneg() {
             let mv = self.hi.max(rhs.hi) as u64;
             let bound = if mv == 0 { 0 } else { ((1u64 << (64 - mv.leading_zeros()).min(63)) - 1) as i64 };
@@ -810,7 +810,9 @@ impl Program {
             for &k in &uniq { cons[k].push(id); rem_uses[k] += 1; }
             deps[id] = uniq;
         }
-        for &o in &self.outputs { if !is_imm(self.nodes[o]) { rem_uses[o] += 1; } }
+        for &o in &self.outputs {
+            if !is_imm(self.nodes[o]) && !matches!(self.nodes[o], Op::Store { .. }) { rem_uses[o] += 1; }
+        }
         let mut rem_deps: Vec<usize> = deps.iter().map(Vec::len).collect();
         let mut ready: Vec<NodeId> = (0..n).filter(|&i| reach[i] && !is_imm(self.nodes[i]) && rem_deps[i] == 0).collect();
         let (mut live, mut peak_ssa, mut live_nodes) = (BTreeSet::new(), 0usize, 0usize);

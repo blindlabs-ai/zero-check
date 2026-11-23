@@ -3,12 +3,14 @@ use std::fs;
 use std::path::Path;
 
 use crate::abstract_eval::{ArchProfile, Domain, Op, Program, ProofStatus, VerifyError};
+use crate::lint_rs::LintKind;
 use crate::ntf1::{verify_ntf1_source, Ntf1Error};
+use crate::rust_fe::verify_rust_functions;
 use crate::simd_fuzz::{
     eval_lanes_x8, fault_name, prove_exhaustive, ProofVerdict, RefineConfig, FAULT_DOUBLE_FREE,
     FAULT_OOB, FAULT_UAF, FAULT_UNINIT, LANES,
 };
-use crate::verify_program;
+use crate::{verify_kernel_rust_source, verify_program};
 
 #[derive(Clone, Debug)]
 pub struct GauntletSummary {
@@ -216,9 +218,25 @@ fn check_kani_and_arch_suite(inv: &mut Vec<String>, guards: &mut Vec<String>, fa
         inv.push("ntf1:airlock canonical_idempotent=true faults_covered=1".to_string());
         guards.push("ntf1:svo_and_retro rejected SVO prose and uncovered Fault.Leak".to_string());
     } else { fails.push("ntf1:airlock knockout failed".to_string()); }
+
+    // 11. Raw `.rs` frontend semantic verifier + --kernel-strict zero-panic gate.
+    let rs_clean = "/// @domain x: 0..=1000\npub fn lut_ok(x: i64, tbl: &[i64; 10]) -> i64 { tbl[((x * x) % 16) as usize] }\n";
+    let rs_buggy = "/// @domain x: 0..=1000\npub fn lut_bad(x: i64, tbl: &[i64; 10]) -> i64 { tbl[((x * x) % 16) as usize] / (x - 777) }\n";
+    let rs_panic = "pub fn bad_k(x: Option<i64>) -> i64 { x.unwrap() }\n";
+    let rep_ok = verify_kernel_rust_source("ok.rs", rs_clean, ArchProfile::X86_64Avx2, RefineConfig::default());
+    let rep_bad = verify_rust_functions("bad.rs", rs_buggy, ArchProfile::X86_64Avx2, RefineConfig::default());
+    let rep_panic = verify_kernel_rust_source("panic.rs", rs_panic, ArchProfile::X86_64Avx2, RefineConfig::default());
+    let caught_777 = matches!(rep_bad.failed.first().map(|f| &f.error), Some(VerifyError::CounterexampleFound { inputs, .. }) if inputs == &vec![777]);
+    let caught_panic = matches!(rep_panic, Err(VerifyError::LintViolations { count: 1 }))
+        && crate::scan_rust_source("panic.rs", rs_panic).findings.iter().any(|f| f.kind == LintKind::PanicCall);
+    if rep_ok.is_ok() && caught_777 && caught_panic {
+        *passed += 1;
+        inv.push("rust_fe:lut_ok ProvenTotal directly from .rs source".to_string());
+        guards.push("rust_fe:div0_777_and_kernel_panic rejected x==777 and .unwrap()".to_string());
+    } else { fails.push("rust_fe:raw .rs semantic knockout failed".to_string()); }
 }
 
-/// Run the full Miri-class + ASan-class + Kani-class + AVX2/NEON + NTF1 self-verification gauntlet.
+/// Run the full Miri-class + ASan-class + Kani-class + AVX2/NEON + NTF1 + Rust-FE self-verification gauntlet.
 #[must_use]
 pub fn run_gauntlet() -> GauntletSummary {
     let (mut inv, mut guards, mut fails, mut passed) = (Vec::new(), Vec::new(), Vec::new(), 0usize);
@@ -226,7 +244,7 @@ pub fn run_gauntlet() -> GauntletSummary {
     check_asan_suite(&mut inv, &mut guards, &mut fails, &mut passed);
     check_kani_and_arch_suite(&mut inv, &mut guards, &mut fails, &mut passed);
     GauntletSummary {
-        checks_passed: passed, checks_total: 10,
+        checks_passed: passed, checks_total: 11,
         proven_invariants: inv, learned_guards: guards, failures: fails,
     }
 }

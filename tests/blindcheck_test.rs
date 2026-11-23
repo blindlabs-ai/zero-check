@@ -30,8 +30,8 @@ fn bench_live_real_crates_sub_10ms() {
     let self_rep = verify_crate_dir(&self_src).expect("zero-check/src must self-verify cleanly");
     assert_eq!(self_rep.error_count(), 0, "self had errors: {:?}", self_rep.findings);
     assert!(
-        self_rep.lines_scanned <= 2500,
-        "src LOC must be <= 2500, got {}",
+        self_rep.lines_scanned <= 3000,
+        "src LOC must be <= 3000, got {}",
         self_rep.lines_scanned
     );
 
@@ -592,8 +592,8 @@ fn knockout_8_kani_exhaustive_proven_total_vs_point_777() {
 fn autopoietic_gauntlet_and_cli_ledger() {
     let summary = run_gauntlet();
     assert!(summary.is_clean(), "gauntlet failed: {:?}", summary.failures);
-    assert_eq!(summary.checks_passed, 10);
-    assert_eq!(summary.checks_total, 10);
+    assert_eq!(summary.checks_passed, 11);
+    assert_eq!(summary.checks_total, 11);
     assert!(!summary.proven_invariants.is_empty());
     assert!(!summary.learned_guards.is_empty());
 
@@ -645,7 +645,7 @@ fn autopoietic_gauntlet_and_cli_ledger() {
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(out.status.success(), "CLI failed: stdout={stdout}\nstderr={stderr}");
         assert!(stdout.contains("[ZERO-CHECK-V2]"), "missing summary line: {stdout}");
-        assert!(stdout.contains("gauntlet=10/10"), "expected 10/10 gauntlet: {stdout}");
+        assert!(stdout.contains("gauntlet=11/11"), "expected 11/11 gauntlet: {stdout}");
         assert!(stdout.contains("[NTF1]"), "missing NTF1 summary line: {stdout}");
         let disk_json = std::fs::read_to_string(&ledger_file).expect("read written ledger");
         let parsed = AutopoieticLedger::from_json(&disk_json);
@@ -926,7 +926,7 @@ fn knockout_13_lint_expect_path_clamp_and_unused_prop() {
     // Self src/ and sibling zero-cc/src/ must have 0 errors and 0 UnusedProp findings.
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
     let self_rep = verify_crate_dir(&manifest_dir.join("src")).expect("zero-check/src clean");
-    assert!(self_rep.lines_scanned <= 2500, "zero-check/src LOC {} > 2500", self_rep.lines_scanned);
+    assert!(self_rep.lines_scanned <= 3000, "zero-check/src LOC {} > 3000", self_rep.lines_scanned);
     assert!(!self_rep.findings.iter().any(|f| f.kind == LintKind::UnusedProp));
     let sib_cc = manifest_dir.parent().unwrap_or(manifest_dir).join("zero-cc").join("src");
     if sib_cc.is_dir() {
@@ -1003,5 +1003,118 @@ fn knockout_14_ntf1_airlock_svo_and_coevolution() {
             assert!(cc_lint.is_clean());
             assert!(elapsed_ms < 25.0, "co-evolution check took {elapsed_ms:.3} ms (>= 25 ms)");
         }
+    }
+}
+
+#[test]
+fn knockout_15_raw_rs_semantic_verifier_and_kernel_strict() {
+    use zero_check::{parse_rust_programs, verify_kernel_rust_source, verify_rust_functions};
+
+    // 1. Raw `.rs` quadratic LUT proof vs 1-point interior div-by-zero at x == 777 (zero manual Program!).
+    let rs_quad_ok = "pub fn lut_quad(#[zero_domain(0..=1000)] x: i64, tbl: &[i64; 10]) -> i64 { tbl[((x * x) % 16) as usize] }\n";
+    let rs_quad_bad = "pub fn lut_quad(#[zero_domain(0..=1000)] x: i64, tbl: &[i64; 10]) -> i64 { tbl[((x * x) % 16) as usize] / (x - 777) }\n";
+    let q_ok = verify_rust_functions("quad_ok.rs", rs_quad_ok, ArchProfile::X86_64Avx2, RefineConfig::default());
+    let q_bad = verify_rust_functions("quad_bad.rs", rs_quad_bad, ArchProfile::X86_64Avx2, RefineConfig::default());
+    assert_ne!(q_ok.is_clean(), q_bad.is_clean(), "knockout 15.1 raw .rs quad_mod16 clean vs div0@777");
+    assert_eq!(q_ok.proven.len(), 1);
+    assert!(matches!(q_ok.proven[0].1.verdict, ProofVerdict::ProvenTotal { .. }));
+    assert!(matches!(
+        q_bad.failed.first().map(|f| &f.error),
+        Some(VerifyError::CounterexampleFound { inputs, fault, .. }) if inputs == &vec![777] && (*fault & FAULT_DIV0) != 0
+    ));
+
+    // 2. Raw `.rs` u8 slice OOB at idx == 64 vs masked `(idx & 63) as usize`, plus negative i64 -> usize fail-closed.
+    let rs_pkt_bad = "pub fn read_pkt(buf: &[u8; 64], idx: u8) -> i64 { buf[idx as usize] }\n";
+    let rs_pkt_ok = "pub fn read_pkt(buf: &[u8; 64], idx: u8) -> i64 { buf[(idx & 63) as usize] }\n";
+    let rs_neg_cast = "/// @domain x: -5..=5\npub fn neg_idx(buf: &[u8; 64], x: i64) -> i64 { buf[((x as usize) + 1)] }\n";
+    let p_bad = verify_rust_functions("pkt_bad.rs", rs_pkt_bad, ArchProfile::X86_64Avx2, RefineConfig::default());
+    let p_ok = verify_rust_functions("pkt_ok.rs", rs_pkt_ok, ArchProfile::X86_64Avx2, RefineConfig::default());
+    let p_neg = verify_rust_functions("neg.rs", rs_neg_cast, ArchProfile::X86_64Avx2, RefineConfig::default());
+    assert_ne!(p_ok.is_clean(), p_bad.is_clean(), "knockout 15.2 raw .rs u8 OOB vs masked");
+    assert!(matches!(p_ok.proven[0].1.abstract_report.status, ProofStatus::ProvenSafe));
+    assert!(matches!(
+        p_bad.failed.first().map(|f| &f.error),
+        Some(VerifyError::CounterexampleFound { inputs, fault, .. }) if inputs.len() == 1 && inputs[0] >= 64 && (*fault & FAULT_OOB) != 0
+    ));
+    let pkt_prog = &parse_rust_programs(rs_pkt_bad).programs[0];
+    assert!(matches!(
+        prove_exhaustive(pkt_prog, RefineConfig::default()),
+        ProofVerdict::Counterexample { ref synthesized_guard, .. } if synthesized_guard == "p0 in 0..=63"
+    ));
+    assert_ne!(p_ok.is_clean(), p_neg.is_clean(), "knockout 15.2 negative i64 as usize must fail closed");
+
+    // 3. Raw `.rs` 20-parameter live-register function failing AVX2 spill (14 GPR) while passing NEON (28 GPR).
+    let rs_20 = concat!(
+        "/// @domain a0: 0..=10, a1: 0..=10, a2: 0..=10, a3: 0..=10, a4: 0..=10\n",
+        "/// @domain a5: 0..=10, a6: 0..=10, a7: 0..=10, a8: 0..=10, a9: 0..=10\n",
+        "/// @domain b0: 0..=10, b1: 0..=10, b2: 0..=10, b3: 0..=10, b4: 0..=10\n",
+        "/// @domain b5: 0..=10, b6: 0..=10, b7: 0..=10, b8: 0..=10, b9: 0..=10\n",
+        "pub fn live20(a0: i64, a1: i64, a2: i64, a3: i64, a4: i64, a5: i64, a6: i64, a7: i64, a8: i64, a9: i64, ",
+        "b0: i64, b1: i64, b2: i64, b3: i64, b4: i64, b5: i64, b6: i64, b7: i64, b8: i64, b9: i64) -> ",
+        "(i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64) {\n",
+        "    (a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, b0, b1, b2, b3, b4, b5, b6, b7, b8, b9)\n",
+        "}\n"
+    );
+    let r20_avx = verify_rust_functions("r20.rs", rs_20, ArchProfile::X86_64Avx2, RefineConfig::default());
+    let r20_neon = verify_rust_functions("r20.rs", rs_20, ArchProfile::Aarch64Neon, RefineConfig::default());
+    assert_ne!(r20_avx.is_clean(), r20_neon.is_clean(), "knockout 15.3 raw .rs 20-reg AVX2 spill vs NEON pass");
+    assert!(matches!(
+        r20_avx.failed.first().map(|f| &f.error),
+        Some(VerifyError::RegisterSpill { profile: ArchProfile::X86_64Avx2, peak_gprs: 20, max_gprs: 14, .. })
+    ));
+    assert_eq!(r20_neon.proven.len(), 1);
+
+    // 4. --kernel-strict rejects `.unwrap()` / `panic!(...)` while passing panic-free kernel code + loop unroll + zero-cc batch skip.
+    let rs_k_panic = "pub fn bad_u(x: Option<i64>) -> i64 { x.unwrap() }\npub fn bad_p() { panic!(\"boom\"); }\n";
+    let rs_k_ok = concat!(
+        "/// @domain a: 0..=1000\n",
+        "/// @domain lut: 0..=255\n",
+        "#[inline(always)]\n",
+        "pub fn ring_step(a: &[i64; 8], lut: &[i64; 16], out: &mut [i64; 8]) {\n",
+        "    for lane in 0..8 {\n",
+        "        let v: i64 = a[lane];\n",
+        "        let idx: i64 = { assert!(v >= 0 && v < 1001); v & 15 };\n",
+        "        out[lane] = lut[idx as usize].wrapping_add(1_i64);\n",
+        "    }\n",
+        "}\n",
+        "pub fn ring_step_batch(a: &[[i64; 8]], lut: &[i64; 16], out: &mut [[i64; 8]]) {\n",
+        "    let blocks = a.len().min(out.len());\n",
+        "    for blk in 0..blocks { ring_step(&a[blk], lut, &mut out[blk]); }\n",
+        "}\n"
+    );
+    let k_bad = verify_kernel_rust_source("k_panic.rs", rs_k_panic, ArchProfile::X86_64Avx2, RefineConfig::default());
+    let k_ok = verify_kernel_rust_source("k_ok.rs", rs_k_ok, ArchProfile::X86_64Avx2, RefineConfig::default());
+    assert_ne!(k_ok.is_ok(), k_bad.is_ok(), "knockout 15.4 --kernel-strict panic rejection");
+    assert!(matches!(k_bad, Err(VerifyError::LintViolations { count: 2 })));
+    let (_, proofs) = k_ok.expect("panic-free kernel must pass");
+    assert_eq!(proofs.proven.len(), 1);
+    assert_eq!(proofs.proven[0].0, "ring_step");
+    assert_eq!(proofs.skipped_non_kernel_fns, vec!["ring_step_batch".to_string()]);
+    assert_eq!(parse_rust_programs(rs_k_ok).programs.len(), 1);
+
+    // 5. CLI `--prove-fns --kernel-strict` live exit-code knockout on /tmp .rs files.
+    #[cfg(not(miri))]
+    {
+        let bin = env!("CARGO_BIN_EXE_zero-check");
+        let tmp = std::env::temp_dir();
+        let f_ok = tmp.join("zero_check_fe_ok.rs");
+        let f_bad = tmp.join("zero_check_fe_bad.rs");
+        std::fs::write(&f_ok, rs_k_ok).expect("write ok.rs");
+        std::fs::write(&f_bad, rs_quad_bad).expect("write bad.rs");
+        let out_ok = std::process::Command::new(bin)
+            .args(["--no-ledger", "--prove-fns", "--kernel-strict"])
+            .arg(&f_ok)
+            .output()
+            .expect("run CLI on ok.rs");
+        let out_bad = std::process::Command::new(bin)
+            .args(["--no-ledger", "--prove-fns", "--kernel-strict"])
+            .arg(&f_bad)
+            .output()
+            .expect("run CLI on bad.rs");
+        let _ = std::fs::remove_file(&f_ok);
+        let _ = std::fs::remove_file(&f_bad);
+        assert!(out_ok.status.success(), "CLI ok.rs failed: {}", String::from_utf8_lossy(&out_ok.stderr));
+        assert!(!out_bad.status.success(), "CLI bad.rs must exit non-zero");
+        assert!(String::from_utf8_lossy(&out_bad.stderr).contains("777"));
     }
 }

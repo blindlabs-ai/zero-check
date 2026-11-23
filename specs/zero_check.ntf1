@@ -2,11 +2,12 @@
 NTF1 zero_check
 
 # Core verification + co-evolution pipelines
-zero_check |> lint_rs |> abstract_eval |> simd_fuzz |> gauntlet
-zero_cc |> ir |> egraph |> codegen |> rust_emit
+zero_check |> lint_rs |> rust_fe |> abstract_eval |> simd_fuzz |> gauntlet
+zero_cc |> rust_fe |> ir |> egraph |> codegen |> rust_emit
 
 # Forward morphisms (+t)
 +t rust_src |> mask_rust_source -> lint_rs
++t rust_src |> parse_rust_programs -> abstract_eval
 +t ntf1_spec |> parse_ntf1 -> emit_ntf1
 +t ir_dag |> sethi_ullman_su -> schedule_report
 +t ir_dag |> interval_congruence_egraph -> abstract_report
@@ -18,6 +19,7 @@ zero_cc |> ir |> egraph |> codegen |> rust_emit
 +t zero_check -> Fault.RegisterSpill
 +t zero_check -> Fault.MemorySafety
 +t zero_check -> Fault.SvoGrammarTax
++t zero_check -> Fault.KernelPanic
 
 # Retro-causal traps (-t)
 -t Fault.UnsafeBlock <- Guard.ForbidUnsafe
@@ -26,7 +28,9 @@ zero_cc |> ir |> egraph |> codegen |> rust_emit
 -t Fault.RegisterSpill <- Guard.DualArchAvx2NeonCliff
 -t Fault.MemorySafety <- Guard.ShadowEpochNoAliasInit
 -t Fault.SvoGrammarTax <- Guard.Ntf1ZeroSvoLexer
+-t Fault.KernelPanic <- Guard.ZeroPanicKernelStrict
 
 # Symmetric airlock fixed-points (0t)
 0t zero_cc >< zero_check
 0t parse_ntf1 |> emit_ntf1 >< parse_ntf1
+0t rust_fe >< abstract_eval

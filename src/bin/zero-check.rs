@@ -5,7 +5,10 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Instant;
 
-use zero_check::{run_gauntlet, scan_crate_dir, verify_ntf1_file, AutopoieticLedger, Severity};
+use zero_check::{
+    promote_kernel_strict, run_gauntlet, scan_crate_dir, verify_crate_functions, verify_ntf1_file,
+    ArchProfile, AutopoieticLedger, RefineConfig, Severity,
+};
 
 struct CliArgs {
     targets: Vec<PathBuf>,
@@ -13,12 +16,18 @@ struct CliArgs {
     ledger_path: Option<PathBuf>,
     emit_json: bool,
     quiet: bool,
+    prove_fns: bool,
+    kernel_strict: bool,
+    arch: ArchProfile,
 }
+
+const USAGE: &str = "usage: zero-check [--ledger <path>] [--no-ledger] [--ntf1 <file>] [--prove-fns] [--kernel-strict] [--arch avx2|neon] [--emit-json] [--quiet] <target1> [target2 ...]";
 
 fn parse_args() -> Result<CliArgs, String> {
     let (mut targets, mut ntf1_files) = (Vec::new(), Vec::new());
     let mut ledger_path = Some(env::temp_dir().join("zero_check_ledger.json"));
-    let (mut emit_json, mut quiet) = (false, false);
+    let (mut emit_json, mut quiet, mut prove_fns, mut kernel_strict) = (false, false, false, false);
+    let mut arch = ArchProfile::X86_64Avx2;
     let mut it = env::args().skip(1);
     while let Some(arg) = it.next() {
         match arg.as_str() {
@@ -30,10 +39,20 @@ fn parse_args() -> Result<CliArgs, String> {
                 let p = it.next().ok_or_else(|| format!("{arg} requires a file path"))?;
                 ntf1_files.push(PathBuf::from(p));
             }
+            "--arch" => {
+                let v = it.next().ok_or_else(|| "--arch requires avx2 or neon".to_string())?;
+                arch = match v.as_str() {
+                    "avx2" => ArchProfile::X86_64Avx2,
+                    "neon" => ArchProfile::Aarch64Neon,
+                    _ => return Err(format!("unknown arch: {v} (expected avx2 or neon)")),
+                };
+            }
+            "--prove-fns" => prove_fns = true,
+            "--kernel-strict" => { kernel_strict = true; prove_fns = true; }
             "--no-ledger" => ledger_path = None,
             "--emit-json" => emit_json = true,
             "--quiet" | "-q" => quiet = true,
-            "--help" | "-h" => return Err("usage: zero-check [--ledger <path>] [--no-ledger] [--ntf1 <file>] [--emit-json] [--quiet] <target1> [target2 ...]".to_string()),
+            "--help" | "-h" => return Err(USAGE.to_string()),
             other if other.starts_with('-') => return Err(format!("unknown flag: {other}")),
             path => {
                 let pb = PathBuf::from(path);
@@ -42,10 +61,8 @@ fn parse_args() -> Result<CliArgs, String> {
             }
         }
     }
-    if targets.is_empty() && ntf1_files.is_empty() {
-        return Err("usage: zero-check [--ledger <path>] [--no-ledger] [--ntf1 <file>] [--emit-json] [--quiet] <target1> [target2 ...]".to_string());
-    }
-    Ok(CliArgs { targets, ntf1_files, ledger_path, emit_json, quiet })
+    if targets.is_empty() && ntf1_files.is_empty() { return Err(USAGE.to_string()); }
+    Ok(CliArgs { targets, ntf1_files, ledger_path, emit_json, quiet, prove_fns, kernel_strict, arch })
 }
 
 fn main() -> ExitCode {
@@ -59,9 +76,11 @@ fn main() -> ExitCode {
     let mut crate_rows = Vec::new();
     let (mut total_files, mut total_lines, mut total_errors, mut total_warnings) = (0usize, 0usize, 0usize, 0usize);
 
+    let mut fn_rows = Vec::new();
     for dir in &args.targets {
         match scan_crate_dir(dir) {
-            Ok(rep) => {
+            Ok(mut rep) => {
+                if args.kernel_strict { promote_kernel_strict(&mut rep); }
                 let errs = rep.error_count();
                 let warns = rep.warning_count();
                 total_files += rep.files_scanned;
@@ -78,6 +97,20 @@ fn main() -> ExitCode {
                 crate_rows.push((dir.display().to_string(), rep.files_scanned, rep.lines_scanned, errs, warns, rep.elapsed_us, rep.findings));
             }
             Err(e) => { eprintln!("[ZERO-CHECK-ERR] {}: {e}", dir.display()); return ExitCode::from(1); }
+        }
+        if args.prove_fns {
+            match verify_crate_functions(dir, args.arch, RefineConfig::default()) {
+                Ok(reps) => {
+                    for r in reps {
+                        total_errors += r.failed.len();
+                        for (fn_name, _) in &r.proven {
+                            crate_invariants.push(format!("fn:{}::{} proven({})", r.file, fn_name, args.arch.name()));
+                        }
+                        fn_rows.push(r);
+                    }
+                }
+                Err(e) => { eprintln!("[ZERO-CHECK-ERR] {}: {e}", dir.display()); return ExitCode::from(1); }
+            }
         }
     }
 
@@ -126,6 +159,13 @@ fn main() -> ExitCode {
         for (path, rep) in &ntf1_rows {
             println!("[NTF1] {path}: +t={} -t={} 0t={} |>={} faults_covered={} idempotent={}",
                 rep.forward_count, rep.retro_count, rep.airlock_count, rep.pipe_count, rep.faults_covered, rep.canonical_idempotent);
+        }
+        for r in &fn_rows {
+            if !r.proven.is_empty() || !r.failed.is_empty() {
+                println!("[RUST-FE] {}: proven={} failed={} skipped={}",
+                    r.file, r.proven.len(), r.failed.len(), r.skipped_non_kernel_fns.len());
+            }
+            for f in &r.failed { eprintln!("  FN-FAIL {}::{}: {}", r.file, f.fn_name, f.error); }
         }
         for fail in &gauntlet.failures { eprintln!("  GAUNTLET-FAIL: {fail}"); }
         let lp_str = args.ledger_path.as_ref().map_or_else(|| "none".to_string(), |p| p.display().to_string());
