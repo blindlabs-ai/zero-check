@@ -580,7 +580,8 @@ fn lower_fn_item(item: &FnItem, items: &[FnItem], toks: &[Tok], inlined: &mut BT
 }
 
 /// Parse and verify all kernel-subset functions across a `.rs` file or crate directory.
-pub fn verify_crate_functions(dir: &Path, profile: ArchProfile, cfg: RefineConfig) -> Result<Vec<RustProofReport>, VerifyError> {
-    let mut files = Vec::new(); crate::lint_rs::collect_rs_files(dir, &mut files)?; files.sort();
+pub fn verify_crate_functions(dir: &Path, profile: ArchProfile, cfg: RefineConfig) -> Result<Vec<RustProofReport>, VerifyError> { verify_crate_functions_skip(dir, profile, cfg, &[]) }
+pub fn verify_crate_functions_skip(dir: &Path, profile: ArchProfile, cfg: RefineConfig, skip: &[String]) -> Result<Vec<RustProofReport>, VerifyError> {
+    let mut files = Vec::new(); crate::lint_rs::collect_rs_files(dir, skip, &mut files)?; files.sort();
     files.into_iter().map(|p| Ok(verify_rust_functions(&p.display().to_string(), &std::fs::read_to_string(&p).map_err(|e| VerifyError::Io(format!("{}: {e}", p.display())))?, profile, cfg))).collect()
 }

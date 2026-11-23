@@ -99,13 +99,26 @@ fn has_nearby_guard(mlines: &[&str], line_idx: usize) -> bool {
     })
 }
 
-struct ScanCtx<'a> { file: &'a str, mlines: &'a [&'a str], out: Vec<LintFinding> }
+fn mark_cfg_test_lines(mlines: &[&str]) -> Vec<bool> {
+    let (mut out, mut pending, mut depth) = (vec![false; mlines.len()], false, 0usize);
+    for (slot, &ml) in out.iter_mut().zip(mlines) {
+        if depth == 0 && ml.contains('#') && (ml.contains("cfg(test)") || ml.contains("cfg(kani)")) { pending = true; }
+        if pending || depth > 0 { *slot = true; }
+        for &c in ml.as_bytes() {
+            if depth > 0 { if c == b'{' { depth += 1; } else if c == b'}' { depth -= 1; } }
+            else if pending { if c == b'{' { depth = 1; pending = false; } else if c == b';' { pending = false; } }
+        }
+    }
+    out
+}
+
+struct ScanCtx<'a> { file: &'a str, mlines: &'a [&'a str], test_lines: &'a [bool], out: Vec<LintFinding> }
 impl<'a> ScanCtx<'a> {
     fn push(&mut self, line: usize, col: usize, severity: Severity, kind: LintKind, raw: &str) {
         self.out.push(LintFinding { file: self.file.to_string(), line, col: col + 1, severity, kind, snippet: raw.trim().chars().take(96).collect() });
     }
     fn scan_ident(&mut self, tok: &str, start: usize, end: usize, line_idx: usize, raw: &str) {
-        let (ml, b, line_no) = (self.mlines[line_idx], self.mlines[line_idx].as_bytes(), line_idx + 1);
+        let (ml, b, line_no, in_test) = (self.mlines[line_idx], self.mlines[line_idx].as_bytes(), line_idx + 1, self.test_lines.get(line_idx).copied().unwrap_or(false));
         match tok {
             "unsafe" if matches!(next_non_ws(b, end), Some((_, b'{' | b'f' | b'i' | b't' | b'e'))) => self.push(line_no, start, Severity::Error, LintKind::UnsafeBlock, raw),
             "transmute" | "transmute_copy" => self.push(line_no, start, Severity::Error, LintKind::Transmute, raw),
@@ -116,8 +129,8 @@ impl<'a> ScanCtx<'a> {
             "clamp" if (matches!(prev_non_ws(b, start), Some((_, b'.'))) || matches!(prev_non_ws(b, start), Some((c, b':')) if matches!(prev_non_ws(b, c), Some((_, b':'))))) && matches!(next_non_ws(b, end), Some((_, b'('))) => self.push(line_no, start, Severity::Error, LintKind::ClampCall, raw),
             "allow" if is_attr_prefix(b, start) && matches!(next_non_ws(b, end), Some((_, b'('))) => self.push(line_no, start, Severity::Error, LintKind::AllowAttr, raw),
             "expect" if is_attr_prefix(b, start) && matches!(next_non_ws(b, end), Some((_, b'('))) => self.push(line_no, start, Severity::Error, LintKind::ExpectAttr, raw),
-            "unwrap" | "expect" if matches!(prev_non_ws(b, start), Some((_, b'.'))) && matches!(next_non_ws(b, end), Some((_, b'('))) => self.push(line_no, start, Severity::Warning, LintKind::PanicCall, raw),
-            "panic" | "unreachable" if matches!(next_non_ws(b, end), Some((bang, b'!')) if matches!(next_non_ws(b, bang + 1), Some((_, b'(')))) => self.push(line_no, start, Severity::Warning, LintKind::PanicCall, raw),
+            "unwrap" | "expect" if !in_test && matches!(prev_non_ws(b, start), Some((_, b'.'))) && matches!(next_non_ws(b, end), Some((_, b'('))) => self.push(line_no, start, Severity::Warning, LintKind::PanicCall, raw),
+            "panic" | "unreachable" if !in_test && matches!(next_non_ws(b, end), Some((bang, b'!')) if matches!(next_non_ws(b, bang + 1), Some((_, b'(')))) => self.push(line_no, start, Severity::Warning, LintKind::PanicCall, raw),
             "todo" | "unimplemented" if matches!(next_non_ws(b, end), Some((bang, b'!')) if matches!(next_non_ws(b, bang + 1), Some((_, b'(')))) => self.push(line_no, start, Severity::Error, LintKind::UnfinishedMacro, raw),
             "as" => if let Some((star, b'*')) = next_non_ws(b, end) {
                 let rest = ml[star + 1..].trim_start();
@@ -125,7 +138,7 @@ impl<'a> ScanCtx<'a> {
             },
             _ => {
                 let kw = matches!(tok, "let" | "const" | "static" | "type" | "struct" | "enum" | "fn" | "pub" | "mut" | "return" | "if" | "else" | "match" | "in" | "where" | "as" | "vec" | "Some" | "Ok" | "Err");
-                if end < b.len() && b[end] == b'[' && !kw {
+                if !in_test && end < b.len() && b[end] == b'[' && !kw {
                     if let Some(rel) = ml[end + 1..].find(']') {
                         let inner = ml[end + 1..end + 1 + rel].trim();
                         let simple = inner.is_empty() || inner.contains(';') || inner.contains("..") || inner.contains('&') || inner.contains('%')
@@ -168,6 +181,7 @@ impl<'a> ScanCtx<'a> {
 fn scan_unused_props(raw_lines: &[&str], mlines: &[&str], ctx: &mut ScanCtx<'_>) {
     let (mut stats, mut decls) = (BTreeMap::<&str, (usize, usize)>::new(), Vec::new());
     for (line_idx, &ml) in mlines.iter().enumerate() {
+        if ctx.test_lines.get(line_idx).copied().unwrap_or(false) { continue; }
         let (b, n, mut i, mut prev2, mut prev1) = (ml.as_bytes(), ml.len(), 0usize, "", "");
         while i < n {
             if b[i].is_ascii_alphabetic() || b[i] == b'_' {
@@ -192,19 +206,24 @@ fn scan_unused_props(raw_lines: &[&str], mlines: &[&str], ctx: &mut ScanCtx<'_>)
     let masked_bytes = mask_rust_source(src.as_bytes());
     let masked = String::from_utf8_lossy(&masked_bytes);
     let (raw_lines, mlines): (Vec<&str>, Vec<&str>) = (src.lines().collect(), masked.lines().collect());
-    let mut ctx = ScanCtx { file, mlines: &mlines, out: Vec::new() };
+    let test_lines = mark_cfg_test_lines(&mlines);
+    let mut ctx = ScanCtx { file, mlines: &mlines, test_lines: &test_lines, out: Vec::new() };
     for (idx, &raw) in raw_lines.iter().enumerate().take(mlines.len()) { ctx.scan_line(idx, raw); }
     scan_unused_props(&raw_lines, &mlines, &mut ctx);
     LintReport { files_scanned: 1, lines_scanned: raw_lines.len(), bytes_scanned: src.len(), elapsed_us: clock_us(t0), findings: ctx.out }
 }
 
-pub(crate) fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), VerifyError> {
-    if dir.is_file() { out.push(dir.to_path_buf()); return Ok(()); }
+fn is_skipped(p: &Path, skip: &[String]) -> bool {
+    skip.iter().any(|s| p.file_name().and_then(|n| n.to_str()) == Some(s.as_str()) || p.ends_with(s))
+}
+
+pub(crate) fn collect_rs_files(dir: &Path, skip: &[String], out: &mut Vec<PathBuf>) -> Result<(), VerifyError> {
+    if dir.is_file() { if !is_skipped(dir, skip) { out.push(dir.to_path_buf()); } return Ok(()); }
     for entry in fs::read_dir(dir).map_err(|e| VerifyError::Io(format!("{}: {e}", dir.display())))? {
         let path = entry.map_err(|e| VerifyError::Io(e.to_string()))?.path();
         let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
-        if path.is_dir() { if !matches!(name, "target" | ".git") { collect_rs_files(&path, out)?; } }
-        else if path.extension().and_then(|s| s.to_str()) == Some("rs") { out.push(path); }
+        if path.is_dir() { if !matches!(name, "target" | ".git") { collect_rs_files(&path, skip, out)?; } }
+        else if path.extension().and_then(|s| s.to_str()) == Some("rs") && !is_skipped(&path, skip) { out.push(path); }
     }
     Ok(())
 }
@@ -215,10 +234,11 @@ pub fn promote_kernel_strict(report: &mut LintReport) {
 }
 
 /// Recursively scan all `.rs` files under `dir` (or a single `.rs` file) deterministically.
-pub fn scan_crate_dir(dir: &Path) -> Result<LintReport, VerifyError> {
+pub fn scan_crate_dir(dir: &Path) -> Result<LintReport, VerifyError> { scan_crate_dir_skip(dir, &[]) }
+pub fn scan_crate_dir_skip(dir: &Path, skip: &[String]) -> Result<LintReport, VerifyError> {
     let t0 = clock_start();
     let mut files = Vec::new();
-    collect_rs_files(dir, &mut files)?;
+    collect_rs_files(dir, skip, &mut files)?;
     files.sort();
     let mut report = LintReport::default();
     for path in files {

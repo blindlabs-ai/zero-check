@@ -1296,3 +1296,60 @@ fn knockout_16_live_miri_head_to_head_and_guarded_branches() {
     assert!(matches!(r_bad.failed.first().map(|f| &f.error), Some(VerifyError::NoAliasViolation { .. })));
     assert!(r_ok.is_clean() && r_ok.proven.len() >= 2);
 }
+
+#[test]
+fn knockout_17_cfg_test_separation_and_cli_skip() {
+    use zero_check::verify_kernel_rust_source;
+
+    let cfg_test_ok = "#[cfg(test)] mod tests { fn t() { Some(1).unwrap(); } }\n";
+    let prod_panic = "pub fn prod() { Some(1).unwrap(); }\n";
+    let cfg_test_unsafe = "#[cfg(test)] mod tests { unsafe fn bad() {} }\n";
+    let cfg_kani_ok = "#[cfg(kani)]\nmod proofs {\n    fn k(i: usize) { let _u = 1; let a = [0; 4]; let _ = a[i]; Some(1).expect(\"k\"); }\n}\n";
+    let cfg_kani_clamp = concat!("#[cfg(kani)] mod bad_k { fn c(x: i64) -> i64 { x.cl", "amp(0, 1) } }\n");
+    let cfg_test_allow = concat!("#[cfg(test)] mod bad_a { #[al", "low(dead_code)] fn f() {} }\n");
+    let cfg_test_ascii = "#[cfg(test)] mod bad_n { fn f() {} // caf\u{00e9}\n}\n";
+
+    let r_test_ok = verify_kernel_rust_source("t_ok.rs", cfg_test_ok, ArchProfile::X86_64Avx2, RefineConfig::default());
+    let r_prod_bad = verify_kernel_rust_source("p_bad.rs", prod_panic, ArchProfile::X86_64Avx2, RefineConfig::default());
+    let r_test_unsafe = verify_kernel_rust_source("t_unsafe.rs", cfg_test_unsafe, ArchProfile::X86_64Avx2, RefineConfig::default());
+    let r_kani_ok = verify_kernel_rust_source("k_ok.rs", cfg_kani_ok, ArchProfile::X86_64Avx2, RefineConfig::default());
+    let r_kani_clamp = verify_kernel_rust_source("k_clamp.rs", cfg_kani_clamp, ArchProfile::X86_64Avx2, RefineConfig::default());
+    let r_test_allow = verify_kernel_rust_source("t_allow.rs", cfg_test_allow, ArchProfile::X86_64Avx2, RefineConfig::default());
+    let r_test_ascii = verify_kernel_rust_source("t_ascii.rs", cfg_test_ascii, ArchProfile::X86_64Avx2, RefineConfig::default());
+
+    assert_ne!(r_test_ok.is_ok(), r_prod_bad.is_ok(), "knockout 17 cfg(test) vs prod PanicCall");
+    assert_ne!(r_test_ok.is_ok(), r_test_unsafe.is_ok(), "knockout 17 cfg(test) must still fail UnsafeBlock");
+    assert_ne!(r_kani_ok.is_ok(), r_kani_clamp.is_ok(), "knockout 17 cfg(kani) must still fail ClampCall");
+    assert_ne!(r_test_ok.is_ok(), r_test_allow.is_ok(), "knockout 17 cfg(test) must still fail AllowAttr");
+    assert_ne!(r_test_ok.is_ok(), r_test_ascii.is_ok(), "knockout 17 cfg(test) must still fail NonAscii");
+    let (lint_ok, _) = r_test_ok.expect("cfg(test) unwrap must pass");
+    assert_eq!((lint_ok.error_count(), lint_ok.warning_count()), (0, 0));
+    let (lint_kani, _) = r_kani_ok.expect("cfg(kani) panic/index/unused must pass");
+    assert_eq!((lint_kani.error_count(), lint_kani.warning_count()), (0, 0));
+    assert!(scan_rust_source("t_unsafe.rs", cfg_test_unsafe).findings.iter().any(|f| f.kind == LintKind::UnsafeBlock));
+
+    #[cfg(not(miri))]
+    {
+        let bin = env!("CARGO_BIN_EXE_zero-check");
+        let root = std::env::temp_dir().join(format!("zero_check_k17_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("mkdir k17");
+        std::fs::write(root.join("safe.rs"), "pub fn id(x: u8) -> i64 { x as i64 }\n").expect("write safe.rs");
+        std::fs::write(root.join("ffi_bad.rs"), "pub fn bad() { unsafe {} }\n").expect("write ffi_bad.rs");
+        let raw_out = std::process::Command::new(bin)
+            .args(["--no-ledger", "--prove-fns", "--kernel-strict", "--exclude-cfg-test"])
+            .arg(&root)
+            .output()
+            .expect("run raw");
+        let skip_out = std::process::Command::new(bin)
+            .args(["--no-ledger", "--prove-fns", "--kernel-strict", "--skip", "ffi_bad.rs"])
+            .arg(&root)
+            .output()
+            .expect("run skip");
+        let _ = std::fs::remove_dir_all(&root);
+        assert_ne!(raw_out.status.success(), skip_out.status.success(), "knockout 17 --skip CLI");
+        assert!(skip_out.status.success(), "skip failed: {}", String::from_utf8_lossy(&skip_out.stderr));
+        let stdout = String::from_utf8_lossy(&skip_out.stdout);
+        assert!(stdout.contains("files=1") && stdout.contains("errors=0 warnings=0"), "unexpected skip stdout: {stdout}");
+    }
+}
