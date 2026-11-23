@@ -1,0 +1,13 @@
+[package]
+name = "zero-check"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+license = "Apache-2.0"
+homepage = "https://blindlabs.ai"
+repository = "https://github.com/blindlabs-ai/zero-check"
+description = "Zero-dependency, zero-spill Miri/ASan/Kani-class autopoietic Rust verifier, linter, and CLI: shadow-epoch memory prover, exhaustive branch-and-bound symbolic refiner, 8-lane SIMD replay, and dual-arch AVX2/NEON spill guard"
+
+[dependencies]
+
+[dev-dependencies]
