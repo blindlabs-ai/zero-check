@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -14,7 +15,8 @@ pub enum Severity { Error, Warning }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LintKind {
     UnsafeBlock, RawPtrProvenance, Transmute, UncheckedIndex, UninitAccess, ClampCall,
-    AllowAttr, UnfinishedMacro, ShiftOverflow, DivByZero, NonAscii, UnguardedIndex,
+    AllowAttr, ExpectAttr, UnfinishedMacro, ShiftOverflow, DivByZero, NonAscii, UnguardedIndex,
+    UnusedProp,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -160,8 +162,9 @@ impl<'a> ScanCtx<'a> {
             "read" | "write" | "copy" | "copy_nonoverlapping" if ml[..start].trim_end().ends_with("ptr::") => self.push(line_no, start, Severity::Error, LintKind::RawPtrProvenance, raw),
             "get_unchecked" | "get_unchecked_mut" => self.push(line_no, start, Severity::Error, LintKind::UncheckedIndex, raw),
             "assume_init" | "assume_init_read" | "assume_init_ref" | "assume_init_mut" | "uninitialized" | "set_len" => self.push(line_no, start, Severity::Error, LintKind::UninitAccess, raw),
-            "clamp" if matches!(prev_non_ws(b, start), Some((_, b'.'))) && matches!(next_non_ws(b, end), Some((_, b'('))) => self.push(line_no, start, Severity::Error, LintKind::ClampCall, raw),
+            "clamp" if matches!(prev_non_ws(b, start), Some((_, b'.'))) || matches!(prev_non_ws(b, start), Some((c, b':')) if matches!(prev_non_ws(b, c), Some((_, b':')))) => if matches!(next_non_ws(b, end), Some((_, b'('))) { self.push(line_no, start, Severity::Error, LintKind::ClampCall, raw); },
             "allow" if is_attr_prefix(b, start) && matches!(next_non_ws(b, end), Some((_, b'('))) => self.push(line_no, start, Severity::Error, LintKind::AllowAttr, raw),
+            "expect" if is_attr_prefix(b, start) && matches!(next_non_ws(b, end), Some((_, b'('))) => self.push(line_no, start, Severity::Error, LintKind::ExpectAttr, raw),
             "todo" | "unimplemented" => if let Some((bang, b'!')) = next_non_ws(b, end) {
                 if matches!(next_non_ws(b, bang + 1), Some((_, b'('))) { self.push(line_no, start, Severity::Error, LintKind::UnfinishedMacro, raw); }
             },
@@ -231,6 +234,31 @@ impl<'a> ScanCtx<'a> {
     }
 }
 
+fn scan_unused_props(raw_lines: &[&str], mlines: &[&str], ctx: &mut ScanCtx<'_>) {
+    let (mut stats, mut decls) = (BTreeMap::<&str, (usize, usize)>::new(), Vec::new());
+    for (line_idx, &ml) in mlines.iter().enumerate() {
+        let (b, n, mut i, mut prev2, mut prev1) = (ml.as_bytes(), ml.len(), 0usize, "", "");
+        while i < n {
+            if b[i].is_ascii_alphabetic() || b[i] == b'_' {
+                let s = i;
+                while i < n && is_ident_byte(b[i]) { i += 1; }
+                let tok = &ml[s..i];
+                if tok.len() > 1 && tok.starts_with('_') && !tok.starts_with("__") {
+                    let e = stats.entry(tok).or_insert((0, 0));
+                    e.0 += 1;
+                    if prev1 == "let" || (prev1 == "mut" && prev2 == "let") { e.1 += 1; decls.push((line_idx, s, tok)); }
+                }
+                prev2 = prev1; prev1 = tok;
+            } else { if !b[i].is_ascii_whitespace() { prev2 = ""; prev1 = ""; } i += 1; }
+        }
+    }
+    for (line_idx, col, tok) in decls {
+        if stats.get(tok).is_some_and(|&(tot, dec)| tot <= dec) {
+            ctx.push(line_idx + 1, col, Severity::Warning, LintKind::UnusedProp, raw_lines[line_idx]);
+        }
+    }
+}
+
 /// Scan a single Rust source string in a single linear pass.
 #[must_use] pub fn scan_rust_source(file: &str, src: &str) -> LintReport {
     let t0 = clock_start();
@@ -239,6 +267,7 @@ impl<'a> ScanCtx<'a> {
     let (raw_lines, mlines): (Vec<&str>, Vec<&str>) = (src.lines().collect(), masked.lines().collect());
     let mut ctx = ScanCtx { file, mlines: &mlines, out: Vec::new() };
     for (idx, &raw) in raw_lines.iter().enumerate().take(mlines.len()) { ctx.scan_line(idx, raw); }
+    scan_unused_props(&raw_lines, &mlines, &mut ctx);
     LintReport { files_scanned: 1, lines_scanned: raw_lines.len(), bytes_scanned: src.len(), elapsed_us: clock_us(t0), findings: ctx.out }
 }
 

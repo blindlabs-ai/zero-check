@@ -3,6 +3,7 @@ use std::fs;
 use std::path::Path;
 
 use crate::abstract_eval::{ArchProfile, Domain, Op, Program, ProofStatus, VerifyError};
+use crate::ntf1::{verify_ntf1_source, Ntf1Error};
 use crate::simd_fuzz::{
     eval_lanes_x8, fault_name, prove_exhaustive, ProofVerdict, RefineConfig, FAULT_DOUBLE_FREE,
     FAULT_OOB, FAULT_UAF, FAULT_UNINIT, LANES,
@@ -199,9 +200,25 @@ fn check_kani_and_arch_suite(inv: &mut Vec<String>, guards: &mut Vec<String>, fa
         *passed += 1;
         inv.push("arch:20reg avx2=spill(20/14) neon=pass(20/28,20/32)".to_string());
     } else { fails.push("arch:20reg dual-arch spill knockout failed".to_string()); }
+
+    // 10. NTF1 causal airlock + zero-SVO + retro-causal completeness knockout.
+    let valid_ntf1 = "NTF1 airlock\n+t zero_cc -> zero_check\n+t zero_check -> Fault.Spill\n-t Fault.Spill <- Guard.Avx2\n0t zero_cc >< zero_check\n";
+    let svo_ntf1 = "NTF1 airlock\n# this is prose\n+t a -> b\n";
+    let uncov_ntf1 = "NTF1 airlock\n+t a -> Fault.Leak\n";
+    let ok = verify_ntf1_source("inline.ntf1", valid_ntf1);
+    let bad_svo = verify_ntf1_source("svo.ntf1", svo_ntf1);
+    let bad_cov = verify_ntf1_source("uncov.ntf1", uncov_ntf1);
+    if matches!(ok, Ok(ref r) if r.canonical_idempotent && r.faults_covered == 1)
+        && matches!(bad_svo, Err(Ntf1Error::SvoTax { .. }))
+        && matches!(bad_cov, Err(Ntf1Error::UncoveredFault { .. }))
+    {
+        *passed += 1;
+        inv.push("ntf1:airlock canonical_idempotent=true faults_covered=1".to_string());
+        guards.push("ntf1:svo_and_retro rejected SVO prose and uncovered Fault.Leak".to_string());
+    } else { fails.push("ntf1:airlock knockout failed".to_string()); }
 }
 
-/// Run the full Miri-class + ASan-class + Kani-class + AVX2/NEON spill self-verification gauntlet.
+/// Run the full Miri-class + ASan-class + Kani-class + AVX2/NEON + NTF1 self-verification gauntlet.
 #[must_use]
 pub fn run_gauntlet() -> GauntletSummary {
     let (mut inv, mut guards, mut fails, mut passed) = (Vec::new(), Vec::new(), Vec::new(), 0usize);
@@ -209,7 +226,7 @@ pub fn run_gauntlet() -> GauntletSummary {
     check_asan_suite(&mut inv, &mut guards, &mut fails, &mut passed);
     check_kani_and_arch_suite(&mut inv, &mut guards, &mut fails, &mut passed);
     GauntletSummary {
-        checks_passed: passed, checks_total: 9,
+        checks_passed: passed, checks_total: 10,
         proven_invariants: inv, learned_guards: guards, failures: fails,
     }
 }

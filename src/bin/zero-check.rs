@@ -5,20 +5,20 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Instant;
 
-use zero_check::{run_gauntlet, scan_crate_dir, AutopoieticLedger, Severity};
+use zero_check::{run_gauntlet, scan_crate_dir, verify_ntf1_file, AutopoieticLedger, Severity};
 
 struct CliArgs {
     targets: Vec<PathBuf>,
+    ntf1_files: Vec<PathBuf>,
     ledger_path: Option<PathBuf>,
     emit_json: bool,
     quiet: bool,
 }
 
 fn parse_args() -> Result<CliArgs, String> {
-    let mut targets = Vec::new();
+    let (mut targets, mut ntf1_files) = (Vec::new(), Vec::new());
     let mut ledger_path = Some(env::temp_dir().join("zero_check_ledger.json"));
-    let mut emit_json = false;
-    let mut quiet = false;
+    let (mut emit_json, mut quiet) = (false, false);
     let mut it = env::args().skip(1);
     while let Some(arg) = it.next() {
         match arg.as_str() {
@@ -26,18 +26,26 @@ fn parse_args() -> Result<CliArgs, String> {
                 let p = it.next().ok_or_else(|| format!("{arg} requires a file path"))?;
                 ledger_path = Some(PathBuf::from(p));
             }
+            "--ntf1" => {
+                let p = it.next().ok_or_else(|| format!("{arg} requires a file path"))?;
+                ntf1_files.push(PathBuf::from(p));
+            }
             "--no-ledger" => ledger_path = None,
             "--emit-json" => emit_json = true,
             "--quiet" | "-q" => quiet = true,
-            "--help" | "-h" => return Err("usage: zero-check [--ledger <path>] [--no-ledger] [--emit-json] [--quiet] <dir1> [dir2 ...]".to_string()),
+            "--help" | "-h" => return Err("usage: zero-check [--ledger <path>] [--no-ledger] [--ntf1 <file>] [--emit-json] [--quiet] <target1> [target2 ...]".to_string()),
             other if other.starts_with('-') => return Err(format!("unknown flag: {other}")),
-            path => targets.push(PathBuf::from(path)),
+            path => {
+                let pb = PathBuf::from(path);
+                if pb.extension().and_then(|s| s.to_str()) == Some("ntf1") { ntf1_files.push(pb); }
+                else { targets.push(pb); }
+            }
         }
     }
-    if targets.is_empty() {
-        return Err("usage: zero-check [--ledger <path>] [--no-ledger] [--emit-json] [--quiet] <dir1> [dir2 ...]".to_string());
+    if targets.is_empty() && ntf1_files.is_empty() {
+        return Err("usage: zero-check [--ledger <path>] [--no-ledger] [--ntf1 <file>] [--emit-json] [--quiet] <target1> [target2 ...]".to_string());
     }
-    Ok(CliArgs { targets, ledger_path, emit_json, quiet })
+    Ok(CliArgs { targets, ntf1_files, ledger_path, emit_json, quiet })
 }
 
 fn main() -> ExitCode {
@@ -73,6 +81,17 @@ fn main() -> ExitCode {
         }
     }
 
+    let mut ntf1_rows = Vec::new();
+    for nf in &args.ntf1_files {
+        match verify_ntf1_file(nf) {
+            Ok(rep) => {
+                crate_invariants.push(format!("ntf1:{} +t={} -t={} 0t={} |>={} faults={}", nf.display(), rep.forward_count, rep.retro_count, rep.airlock_count, rep.pipe_count, rep.faults_covered));
+                ntf1_rows.push((nf.display().to_string(), rep));
+            }
+            Err(e) => { total_errors += 1; eprintln!("[ZERO-CHECK-NTF1-ERR] {}: {e}", nf.display()); }
+        }
+    }
+
     let gauntlet = run_gauntlet();
     let mut all_invariants = crate_invariants;
     all_invariants.extend(gauntlet.proven_invariants.clone());
@@ -103,6 +122,10 @@ fn main() -> ExitCode {
             for f in findings.iter().filter(|f| f.severity == Severity::Error) {
                 eprintln!("  ERROR {}:{}:{} {:?}: {}", f.file, f.line, f.col, f.kind, f.snippet);
             }
+        }
+        for (path, rep) in &ntf1_rows {
+            println!("[NTF1] {path}: +t={} -t={} 0t={} |>={} faults_covered={} idempotent={}",
+                rep.forward_count, rep.retro_count, rep.airlock_count, rep.pipe_count, rep.faults_covered, rep.canonical_idempotent);
         }
         for fail in &gauntlet.failures { eprintln!("  GAUNTLET-FAIL: {fail}"); }
         let lp_str = args.ledger_path.as_ref().map_or_else(|| "none".to_string(), |p| p.display().to_string());

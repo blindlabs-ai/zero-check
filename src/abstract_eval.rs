@@ -74,7 +74,8 @@ pub enum VerifyError {
     OutOfBounds { node: NodeId, idx_lo: i64, idx_hi: i64, limit: usize },
     IntOverflow { node: NodeId }, ShiftOverflow { node: NodeId, lo: i64, hi: i64 }, DivByZero { node: NodeId },
     RegisterSpill { profile: ArchProfile, peak_gprs: usize, max_gprs: usize, peak_vecs: usize, max_vecs: usize },
-    CounterexampleFound { node: NodeId, fault: u8, inputs: Vec<i64> }, LintViolations { count: usize }, Io(String),
+    CounterexampleFound { node: NodeId, fault: u8, inputs: Vec<i64> }, LintViolations { count: usize },
+    Ntf1Violation(String), Io(String),
 }
 
 impl fmt::Display for VerifyError {
@@ -95,6 +96,7 @@ impl fmt::Display for VerifyError {
             Self::RegisterSpill { profile, peak_gprs, max_gprs, peak_vecs, max_vecs } => write!(f, "register spill on {}: gprs {peak_gprs}/{max_gprs}, vecs {peak_vecs}/{max_vecs}", profile.name()),
             Self::CounterexampleFound { node, fault, inputs } => write!(f, "counterexample node {node} fault 0x{fault:02x}: {inputs:?}"),
             Self::LintViolations { count } => write!(f, "static Rust linter found {count} error(s)"),
+            Self::Ntf1Violation(msg) => write!(f, "ntf1 violation: {msg}"),
             Self::Io(msg) => write!(f, "io error: {msg}"),
         }
     }
@@ -793,12 +795,18 @@ impl Program {
             stack.extend_from_slice(&kids[..cnt]);
         }
         let is_imm = |op: IrOp| matches!(op, Op::Const(_) | Op::Free(_));
-        let (mut deps, mut cons, mut rem_uses) = (vec![Vec::new(); n], vec![Vec::new(); n], vec![0usize; n]);
+        let (mut su, mut deps, mut cons, mut rem_uses) = (vec![0usize; n], vec![Vec::new(); n], vec![Vec::new(); n], vec![0usize; n]);
         for id in 0..n {
             if !reach[id] || is_imm(self.nodes[id]) { continue; }
             let (kids, cnt) = self.nodes[id].children();
             let mut uniq = Vec::new();
             for &k in &kids[..cnt] { if !is_imm(self.nodes[k]) && !uniq.contains(&k) { uniq.push(k); } }
+            su[id] = match uniq.as_slice() {
+                [] => 1,
+                [a] => su[*a].max(1),
+                [a, b] => if su[*a] == su[*b] { su[*a] + 1 } else { su[*a].max(su[*b]) },
+                _ => 1,
+            };
             for &k in &uniq { cons[k].push(id); rem_uses[k] += 1; }
             deps[id] = uniq;
         }
@@ -807,10 +815,12 @@ impl Program {
         let mut ready: Vec<NodeId> = (0..n).filter(|&i| reach[i] && !is_imm(self.nodes[i]) && rem_deps[i] == 0).collect();
         let (mut live, mut peak_ssa, mut live_nodes) = (BTreeSet::new(), 0usize, 0usize);
         while !ready.is_empty() {
-            let mut best = (0usize, (isize::MAX, usize::MAX));
+            let mut best = (0usize, (isize::MAX, 1usize, usize::MAX, usize::MAX));
             for (pos, &u) in ready.iter().enumerate() {
                 let kills = deps[u].iter().filter(|&&d| rem_uses[d] == 1).count() as isize;
-                let key = (isize::from(rem_uses[u] > 0) - kills, u);
+                let delta = isize::from(rem_uses[u] > 0) - kills;
+                let helps = usize::from(!cons[u].iter().any(|&c| deps[c].iter().any(|d| live.contains(d))));
+                let key = (delta, helps, usize::MAX - su[u], u);
                 if key < best.1 { best = (pos, key); }
             }
             let u = ready.swap_remove(best.0);

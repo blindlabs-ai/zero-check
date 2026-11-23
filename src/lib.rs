@@ -3,6 +3,7 @@
 pub mod abstract_eval;
 pub mod gauntlet;
 pub mod lint_rs;
+pub mod ntf1;
 pub mod simd_fuzz;
 
 use std::path::Path;
@@ -13,6 +14,10 @@ pub use abstract_eval::{
 };
 pub use gauntlet::{build_quad_mod16_kernel, run_gauntlet, AutopoieticLedger, GauntletSummary};
 pub use lint_rs::{scan_crate_dir, scan_rust_source, LintFinding, LintKind, LintReport, Severity};
+pub use ntf1::{
+    check_svo_tax, emit_ntf1, parse_ntf1, verify_ntf1_file, verify_ntf1_source, Ntf1Doc, Ntf1Error,
+    Ntf1Kind, Ntf1Report, Ntf1Stmt,
+};
 pub use simd_fuzz::{
     eval_lanes_x8, fault_name, format_box_invariant, prove_exhaustive, refine_and_fuzz,
     sample_batch_x8, BatchEval, Counterexample, ProofVerdict, RefineConfig, RefineReport,

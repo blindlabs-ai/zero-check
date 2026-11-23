@@ -414,8 +414,8 @@ fn static_lint_hygiene_and_comment_masking() {
         "// unsafe { std::mem::transmute(x) } x << 64 x / 0\n",
         "/* outer /* unsafe ptr::read */ as *const u8 */\n",
         "pub fn pick<'a>(a: &'a str, _b: &'a str) -> (&'a str, char) {\n",
-        "    let _s = \"unsafe transmute as *mut u8 todo!()\";\n",
-        "    let _r = r#\"get_unchecked x << 64 x / 0\"#;\n",
+        "    let _ = \"unsafe transmute as *mut u8 todo!()\";\n",
+        "    let _ = r#\"get_unchecked x << 64 x / 0\"#;\n",
         "    (a, '\\'')\n",
         "}\n"
     );
@@ -473,7 +473,7 @@ fn knockout_6_asan_use_after_free_and_stale_gen() {
     // Dynamic Alloc expansion that overlaps a neighbor or wraps usize pointer offset must fail closed.
     let mut grow_alias = Program::new("grow_alias");
     let ga = grow_alias.add_buf("a", 8, true, 1, 0, Domain::range(0, 10));
-    let _gb = grow_alias.add_buf("b", 8, false, 1, 16, Domain::range(0, 10));
+    let _ = grow_alias.add_buf("b", 8, false, 1, 16, Domain::range(0, 10));
     let g_id = grow_alias.push(Op::Alloc { buf: ga, len: 24 });
     grow_alias.add_output(g_id);
     assert_eq!(
@@ -592,8 +592,8 @@ fn knockout_8_kani_exhaustive_proven_total_vs_point_777() {
 fn autopoietic_gauntlet_and_cli_ledger() {
     let summary = run_gauntlet();
     assert!(summary.is_clean(), "gauntlet failed: {:?}", summary.failures);
-    assert_eq!(summary.checks_passed, 9);
-    assert_eq!(summary.checks_total, 9);
+    assert_eq!(summary.checks_passed, 10);
+    assert_eq!(summary.checks_total, 10);
     assert!(!summary.proven_invariants.is_empty());
     assert!(!summary.learned_guards.is_empty());
 
@@ -621,7 +621,13 @@ fn autopoietic_gauntlet_and_cli_ledger() {
         let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
         let workspace_parent = manifest_dir.parent().unwrap_or(manifest_dir);
         let mut cmd = std::process::Command::new(bin);
-        cmd.arg("--ledger").arg(&ledger_file).arg(manifest_dir.join("src"));
+        cmd.arg("--ledger").arg(&ledger_file)
+            .arg("--ntf1").arg(manifest_dir.join("specs").join("zero_check.ntf1"))
+            .arg(manifest_dir.join("src"));
+        let cc_ntf1 = workspace_parent.join("zero-cc").join("specs").join("zero_cc.ntf1");
+        if cc_ntf1.is_file() {
+            cmd.arg(cc_ntf1);
+        }
         for sib in [
             workspace_parent.join("zero-cc").join("src"),
             workspace_parent.join("zero-proxy").join("src").join("blindbind"),
@@ -639,7 +645,8 @@ fn autopoietic_gauntlet_and_cli_ledger() {
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(out.status.success(), "CLI failed: stdout={stdout}\nstderr={stderr}");
         assert!(stdout.contains("[ZERO-CHECK-V2]"), "missing summary line: {stdout}");
-        assert!(stdout.contains("gauntlet=9/9"), "expected 9/9 gauntlet: {stdout}");
+        assert!(stdout.contains("gauntlet=10/10"), "expected 10/10 gauntlet: {stdout}");
+        assert!(stdout.contains("[NTF1]"), "missing NTF1 summary line: {stdout}");
         let disk_json = std::fs::read_to_string(&ledger_file).expect("read written ledger");
         let parsed = AutopoieticLedger::from_json(&disk_json);
         assert_eq!(parsed.epochs, 1);
@@ -839,4 +846,162 @@ fn knockout_11_high_slot_init_and_contradictory_domain() {
 
     assert_eq!(Domain { lo: 0, hi: 10, modulus: 2, rem: 3 }.tighten(), None);
     assert_eq!(Domain { lo: 0, hi: 10, modulus: 0, rem: 0 }.tighten(), None);
+}
+
+#[test]
+fn knockout_12_sethi_ullman_vs_naive_schedule() {
+    // Interleaved 32-leaf balanced binary tree: even leaves pushed before odd leaves.
+    // Naive (delta, u) schedules all 16 even leaves first (peak >= 17 > 14 AVX2 GPRs),
+    // while Sethi-Ullman (delta, helps, !su[u], u) pairs each sibling immediately (peak <= 7).
+    let mut p = Program::new("interleaved_tree32");
+    p.simd_lanes = 2;
+    let mut even = Vec::new();
+    let mut odd = Vec::new();
+    for _ in 0..16 { even.push(p.add_param(Domain::range(0, 100))); }
+    for _ in 0..16 { odd.push(p.add_param(Domain::range(0, 100))); }
+    let mut level: Vec<usize> = even.into_iter().zip(odd).map(|(a, b)| p.push(Op::Add(a, b))).collect();
+    while level.len() > 1 {
+        let mut next = Vec::with_capacity(level.len() / 2);
+        for pair in level.chunks_exact(2) {
+            next.push(p.push(Op::Add(pair[0], pair[1])));
+        }
+        level = next;
+    }
+    p.add_output(level[0]);
+
+    // Compute naive (delta, u) peak live count on the exact same DAG.
+    let n = p.nodes.len();
+    let (mut deps, mut cons, mut rem_uses) = (vec![Vec::new(); n], vec![Vec::new(); n], vec![0usize; n]);
+    for (id, dep) in deps.iter_mut().enumerate() {
+        let (kids, cnt) = p.nodes[id].children();
+        for &k in &kids[..cnt] {
+            if !dep.contains(&k) { dep.push(k); cons[k].push(id); rem_uses[k] += 1; }
+        }
+    }
+    rem_uses[level[0]] += 1;
+    let mut rem_deps: Vec<usize> = deps.iter().map(Vec::len).collect();
+    let mut ready: Vec<usize> = (0..n).filter(|&i| rem_deps[i] == 0).collect();
+    let (mut live, mut naive_peak) = (std::collections::BTreeSet::new(), 0usize);
+    while !ready.is_empty() {
+        let mut best = (0usize, (isize::MAX, usize::MAX));
+        for (pos, &u) in ready.iter().enumerate() {
+            let kills = deps[u].iter().filter(|&&d| rem_uses[d] == 1).count() as isize;
+            let key = (isize::from(rem_uses[u] > 0) - kills, u);
+            if key < best.1 { best = (pos, key); }
+        }
+        let u = ready.swap_remove(best.0);
+        naive_peak = naive_peak.max(live.len() + usize::from(rem_uses[u] > 0));
+        if rem_uses[u] > 0 { live.insert(u); }
+        for &d in &deps[u] { rem_uses[d] -= 1; if rem_uses[d] == 0 { live.remove(&d); } }
+        for &c in &cons[u] { rem_deps[c] -= 1; if rem_deps[c] == 0 { ready.push(c); } }
+    }
+
+    let su_rep = p.verify_schedule(ArchProfile::X86_64Avx2).expect("Sethi-Ullman must fit AVX2 14-GPR cliff");
+    assert!(naive_peak > 14, "expected naive (delta, u) to exceed AVX2 14-GPR cliff, got {naive_peak}");
+    assert!(su_rep.peak_gprs <= 14, "Sethi-Ullman peak {} must fit AVX2 14-GPR cliff", su_rep.peak_gprs);
+    assert_ne!(su_rep.peak_gprs, naive_peak, "knockout 12 Sethi-Ullman vs naive (delta, u) peak GPRs");
+    assert!(su_rep.peak_gprs < naive_peak);
+}
+
+#[test]
+fn knockout_13_lint_expect_path_clamp_and_unused_prop() {
+    let clean_src = "pub fn ok(x: i64) -> i64 { let _ = x; let _used = x.min(1).max(0); _used }\n";
+    let expect_src = "#[expect(dead_code)]\npub fn f() {}\n";
+    let path_clamp_src = "pub fn f(x: i64) -> i64 { i64::clamp(x, 0, 1) }\n";
+    let unused_prop_src = "pub fn f(x: i64) -> i64 { let _prop = x + 1; x }\n";
+
+    let r_clean = scan_rust_source("clean.rs", clean_src);
+    let r_expect = scan_rust_source("expect.rs", expect_src);
+    let r_pclamp = scan_rust_source("pclamp.rs", path_clamp_src);
+    let r_uprop = scan_rust_source("uprop.rs", unused_prop_src);
+
+    assert!(r_clean.is_clean() && r_clean.warning_count() == 0);
+    assert_ne!(r_clean.is_clean(), r_expect.is_clean(), "knockout 13 #[expect(...)]");
+    assert!(r_expect.findings.iter().any(|f| f.kind == LintKind::ExpectAttr));
+    assert_ne!(r_clean.is_clean(), r_pclamp.is_clean(), "knockout 13 i64::clamp(...)");
+    assert!(r_pclamp.findings.iter().any(|f| f.kind == LintKind::ClampCall));
+    assert_ne!(r_clean.warning_count(), r_uprop.warning_count(), "knockout 13 unused _var prop");
+    assert!(r_uprop.findings.iter().any(|f| f.kind == LintKind::UnusedProp));
+
+    // Self src/ and sibling zero-cc/src/ must have 0 errors and 0 UnusedProp findings.
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let self_rep = verify_crate_dir(&manifest_dir.join("src")).expect("zero-check/src clean");
+    assert!(self_rep.lines_scanned <= 2500, "zero-check/src LOC {} > 2500", self_rep.lines_scanned);
+    assert!(!self_rep.findings.iter().any(|f| f.kind == LintKind::UnusedProp));
+    let sib_cc = manifest_dir.parent().unwrap_or(manifest_dir).join("zero-cc").join("src");
+    if sib_cc.is_dir() {
+        let cc_rep = verify_crate_dir(&sib_cc).expect("zero-cc/src clean");
+        assert!(!cc_rep.findings.iter().any(|f| f.kind == LintKind::UnusedProp));
+    }
+}
+
+#[test]
+fn knockout_14_ntf1_airlock_svo_and_coevolution() {
+    use zero_check::{emit_ntf1, parse_ntf1, verify_ntf1_file, verify_ntf1_source, Ntf1Error};
+
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let self_spec_path = manifest_dir.join("specs").join("zero_check.ntf1");
+    let self_src = std::fs::read_to_string(&self_spec_path).expect("read specs/zero_check.ntf1");
+    let self_rep = verify_ntf1_file(&self_spec_path).expect("specs/zero_check.ntf1 must pass");
+    assert!(self_rep.canonical_idempotent);
+    assert!(self_rep.forward_count >= 5 && self_rep.retro_count >= 5 && self_rep.airlock_count >= 2);
+    assert!(self_rep.faults_covered >= 6);
+    let canon1 = emit_ntf1(&parse_ntf1(&self_src).expect("parse self spec"));
+    let canon2 = emit_ntf1(&parse_ntf1(&canon1).expect("reparse canonical"));
+    assert_eq!(canon1, canon2, "emit_ntf1(parse_ntf1(s)) must be an exact fixed-point");
+
+    // Counterfactual knockouts: SVO prose, comment SVO, dangling +t, uncovered Fault.*, broken 0t.
+    let svo_code = "NTF1 bad\n+t the -> b\n";
+    let svo_comment = "NTF1 bad\n# this comment carries SVO tax\n+t a -> b\n";
+    let dangling = "NTF1 bad\n+t a ->\n";
+    let uncov_fault = "NTF1 bad\n+t a -> Fault.Spill\n";
+    let bad_0t_dir = "NTF1 bad\n+t a -> b\n0t a -> b\n";
+    let bad_0t_ungrounded = "NTF1 bad\n+t a -> b\n0t a >< ghost\n";
+    let bad_0t_partial_pipe = "NTF1 bad\n+t a -> b\n0t a |> ghost >< b\n";
+    let ok_0t_full_pipe = "NTF1 ok\n+t a -> b\n0t a |> b >< b\n";
+    let non_ascii = "NTF1 bad\n# caf\u{00e9}\n+t a -> b\n";
+
+    let ok_res = verify_ntf1_source("zero_check.ntf1", &self_src);
+    let r_svo1 = verify_ntf1_source("svo1.ntf1", svo_code);
+    let r_svo2 = verify_ntf1_source("svo2.ntf1", svo_comment);
+    let r_dang = verify_ntf1_source("dang.ntf1", dangling);
+    let r_uncov = verify_ntf1_source("uncov.ntf1", uncov_fault);
+    let r_0t1 = verify_ntf1_source("0t1.ntf1", bad_0t_dir);
+    let r_0t2 = verify_ntf1_source("0t2.ntf1", bad_0t_ungrounded);
+    let r_0t_partial = verify_ntf1_source("0t_partial.ntf1", bad_0t_partial_pipe);
+    let r_0t_full = verify_ntf1_source("0t_full.ntf1", ok_0t_full_pipe);
+    let r_ascii = verify_ntf1_source("ascii.ntf1", non_ascii);
+
+    assert_ne!(ok_res.is_ok(), r_svo1.is_ok(), "knockout 14 SVO token");
+    assert!(matches!(r_svo1, Err(Ntf1Error::SvoTax { .. })));
+    assert_ne!(ok_res.is_ok(), r_svo2.is_ok(), "knockout 14 SVO in # comment");
+    assert!(matches!(r_svo2, Err(Ntf1Error::SvoTax { .. })));
+    assert_ne!(ok_res.is_ok(), r_dang.is_ok(), "knockout 14 dangling +t");
+    assert!(matches!(r_dang, Err(Ntf1Error::DanglingMorphism { .. })));
+    assert_ne!(ok_res.is_ok(), r_uncov.is_ok(), "knockout 14 uncovered Fault.*");
+    assert!(matches!(r_uncov, Err(Ntf1Error::UncoveredFault { .. })));
+    assert_ne!(ok_res.is_ok(), r_0t1.is_ok(), "knockout 14 0t wrong operator");
+    assert!(matches!(r_0t1, Err(Ntf1Error::BrokenAirlock { .. })));
+    assert_ne!(ok_res.is_ok(), r_0t2.is_ok(), "knockout 14 ungrounded 0t");
+    assert!(matches!(r_0t2, Err(Ntf1Error::BrokenAirlock { .. })));
+    assert_ne!(r_0t_full.is_ok(), r_0t_partial.is_ok(), "knockout 14 0t all-atoms airlock grounding");
+    assert!(r_0t_full.is_ok());
+    assert!(matches!(r_0t_partial, Err(Ntf1Error::BrokenAirlock { .. })));
+    assert!(matches!(r_ascii, Err(Ntf1Error::NonAscii { .. })));
+
+    // Cross-crate NTF1 + Rust co-evolution check when ../zero-cc is present (< 25 ms).
+    #[cfg(not(miri))]
+    {
+        let sib_root = manifest_dir.parent().unwrap_or(manifest_dir).join("zero-cc");
+        let sib_spec = sib_root.join("specs").join("zero_cc.ntf1");
+        if sib_spec.is_file() {
+            let t0 = std::time::Instant::now();
+            let cc_ntf1 = verify_ntf1_file(&sib_spec).expect("../zero-cc/specs/zero_cc.ntf1 must pass");
+            let cc_lint = verify_crate_dir(&sib_root.join("src")).expect("../zero-cc/src must pass");
+            let elapsed_ms = (t0.elapsed().as_micros() as f64) / 1000.0;
+            assert!(cc_ntf1.canonical_idempotent);
+            assert!(cc_lint.is_clean());
+            assert!(elapsed_ms < 25.0, "co-evolution check took {elapsed_ms:.3} ms (>= 25 ms)");
+        }
+    }
 }
