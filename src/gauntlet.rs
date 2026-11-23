@@ -1,316 +1,154 @@
-use std::collections::BTreeSet;
-use std::fs;
-use std::path::Path;
-
+use std::{collections::BTreeSet, fs, path::Path};
 use crate::abstract_eval::{ArchProfile, Domain, Op, Program, ProofStatus, VerifyError};
 use crate::lint_rs::LintKind;
 use crate::ntf1::{verify_ntf1_source, Ntf1Error};
 use crate::rust_fe::verify_rust_functions;
-use crate::simd_fuzz::{
-    eval_lanes_x8, fault_name, prove_exhaustive, ProofVerdict, RefineConfig, FAULT_DOUBLE_FREE,
-    FAULT_OOB, FAULT_UAF, FAULT_UNINIT, LANES,
-};
+use crate::simd_fuzz::{eval_lanes_x8, fault_name, prove_exhaustive, ProofVerdict, RefineConfig, FAULT_DOUBLE_FREE, FAULT_OOB, FAULT_UAF, FAULT_UNINIT, LANES};
 use crate::{verify_kernel_rust_source, verify_program};
+
+macro_rules! prog {
+    ($name:expr; $($body:tt)*) => {{ let mut p = Program::new($name); prog!(@s p; $($body)*); p }};
+    (@s $p:ident;) => {};
+    (@s $p:ident; buf $v:ident = ($n:expr, $l:expr, $m:expr, $r:expr, $o:expr, $d:expr); $($t:tt)*) => { let $v = $p.add_buf($n, $l, $m, $r, $o, $d); prog!(@s $p; $($t)*); };
+    (@s $p:ident; uninit $v:ident = ($n:expr, $l:expr, $m:expr, $r:expr, $o:expr, $d:expr); $($t:tt)*) => { let $v = $p.add_uninit_buf($n, $l, $m, $r, $o, $d); prog!(@s $p; $($t)*); };
+    (@s $p:ident; param $v:ident = $d:expr; $($t:tt)*) => { let $v = $p.add_param($d); prog!(@s $p; $($t)*); };
+    (@s $p:ident; let $v:ident = $op:expr; $($t:tt)*) => { let $v = $p.push($op); prog!(@s $p; $($t)*); };
+    (@s $p:ident; do $op:expr; $($t:tt)*) => { $p.push($op); prog!(@s $p; $($t)*); };
+    (@s $p:ident; out $v:expr; $($t:tt)*) => { $p.add_output($v); prog!(@s $p; $($t)*); };
+}
 
 #[derive(Clone, Debug)]
 pub struct GauntletSummary {
-    pub checks_passed: usize,
-    pub checks_total: usize,
-    pub proven_invariants: Vec<String>,
-    pub learned_guards: Vec<String>,
-    pub failures: Vec<String>,
+    pub checks_passed: usize, pub checks_total: usize,
+    pub proven_invariants: Vec<String>, pub learned_guards: Vec<String>, pub failures: Vec<String>,
 }
-
-impl GauntletSummary {
-    #[must_use] pub fn is_clean(&self) -> bool {
-        self.failures.is_empty() && self.checks_passed == self.checks_total
-    }
-}
+impl GauntletSummary { #[must_use] pub fn is_clean(&self) -> bool { self.failures.is_empty() && self.checks_passed == self.checks_total } }
 
 /// Build the non-linear `(x * x) % 16` kernel on `x in [0, 1000]` with optional 1-point fault at `x == 777`.
-#[must_use]
-pub fn build_quad_mod16_kernel(with_777_fault: bool) -> Program {
-    let mut p = Program::new(if with_777_fault { "quad_mod16_fault777" } else { "quad_mod16_clean" });
-    let lut = p.add_buf("qr16_lut", 10, false, 1, 0, Domain::range(0, 255));
-    let x = p.add_param(Domain::range(0, 1000));
-    let sq = p.push(Op::Mul(x, x));
-    let c16 = p.push(Op::Const(16));
-    let idx = p.push(Op::Rem(sq, c16));
-    let val = p.push(Op::Load { buf: lut, idx });
-    if with_777_fault {
-        let c777 = p.push(Op::Const(777));
-        let denom = p.push(Op::Sub(x, c777));
-        let q = p.push(Op::Div(val, denom));
-        p.add_output(q);
-    } else {
-        p.add_output(idx);
-    }
+#[must_use] pub fn build_quad_mod16_kernel(with_777_fault: bool) -> Program {
+    let mut p = prog!(if with_777_fault { "quad_mod16_fault777" } else { "quad_mod16_clean" };
+        buf lut = ("qr16_lut", 10, false, 1, 0, Domain::range(0, 255)); param x = Domain::range(0, 1000);
+        let sq = Op::Mul(x, x); let c16 = Op::Const(16); let idx = Op::Rem(sq, c16); do Op::Load { buf: lut, idx };
+    );
+    if with_777_fault { let c777 = p.push(Op::Const(777)); let denom = p.push(Op::Sub(0, c777)); let q = p.push(Op::Div(4, denom)); p.add_output(q); } else { p.add_output(4); }
     p
 }
 
 fn check_miri_suite(inv: &mut Vec<String>, guards: &mut Vec<String>, fails: &mut Vec<String>, passed: &mut usize) {
-    // 1. Miri-class noalias overlap knockout.
-    let mut alias = Program::new("miri_noalias");
-    let a = alias.add_buf("a", 16, true, 1, 0, Domain::range(0, 100));
-    let b = alias.add_buf("b", 16, false, 1, 8, Domain::range(0, 100));
-    let i = alias.add_param(Domain::range(0, 15));
-    let v = alias.push(Op::Load { buf: b, idx: i });
-    let s = alias.push(Op::Store { buf: a, idx: i, val: v });
-    alias.add_output(s);
-    if matches!(verify_program(&alias, ArchProfile::Aarch64Neon, RefineConfig::default()), Err(VerifyError::NoAliasViolation { .. })) {
-        *passed += 1;
-        guards.push("miri:noalias rejected overlapping &mut/& in region 1".to_string());
-    } else { fails.push("miri:noalias failed to catch overlap".to_string()); }
-
-    // 2. Miri-class shift UB knockout (`<< 64`).
-    let mut sh = Program::new("miri_shl64");
-    let x = sh.add_param(Domain::range(0, 100));
-    let o = sh.push(Op::Shl(x, 64));
-    sh.add_output(o);
-    if matches!(verify_program(&sh, ArchProfile::X86_64Avx2, RefineConfig::default()), Err(VerifyError::ShiftOverflow { lo: 64, hi: 64, .. })) {
-        *passed += 1;
-        guards.push("miri:shift_ub rejected << 64 statically".to_string());
-    } else { fails.push("miri:shift_ub failed to catch << 64".to_string()); }
-
-    // 3. Miri-class interior div-by-zero CEGAR (`x == 42` in `[0, 100_000]`).
-    let mut dv = Program::new("miri_div0_42");
-    let xd = dv.add_param(Domain::range(0, 100_000));
-    let c100 = dv.push(Op::Const(100));
-    let c42 = dv.push(Op::Const(42));
-    let sub = dv.push(Op::Sub(xd, c42));
-    let q = dv.push(Op::Div(c100, sub));
-    dv.add_output(q);
-    if matches!(verify_program(&dv, ArchProfile::Aarch64Neon, RefineConfig::default()), Err(VerifyError::CounterexampleFound { inputs, .. }) if inputs == vec![42]) {
-        *passed += 1;
-        guards.push("miri:div0 ce=[42] isolated in [0..=100000]".to_string());
-    } else { fails.push("miri:div0 failed to catch x == 42".to_string()); }
-
-    // E-Graph static cancellation invariant.
-    let mut eg = Program::new("miri_egraph");
-    let tb = eg.add_buf("tbl", 16, false, 1, 0, Domain::range(0, 255));
-    let xe = eg.add_param(Domain::range(0, 1000));
-    let c12 = eg.push(Op::Const(12));
-    let sm = eg.push(Op::Add(xe, c12));
-    let df = eg.push(Op::Sub(sm, xe));
-    let ld = eg.push(Op::Load { buf: tb, idx: df });
-    eg.add_output(ld);
-    if matches!(verify_program(&eg, ArchProfile::Aarch64Neon, RefineConfig::default()), Ok(r) if r.abstract_report.status == ProofStatus::ProvenSafe) {
-        inv.push("miri:egraph (x + 12) - x == 12 statically proven on x in 0..=1000".to_string());
-    }
+    let cfg = RefineConfig::default();
+    let alias = prog!("miri_noalias"; buf a = ("a", 16, true, 1, 0, Domain::range(0, 100)); buf b = ("b", 16, false, 1, 8, Domain::range(0, 100)); param i = Domain::range(0, 15); let v = Op::Load { buf: b, idx: i }; let s = Op::Store { buf: a, idx: i, val: v }; out s;);
+    if matches!(verify_program(&alias, ArchProfile::Aarch64Neon, cfg), Err(VerifyError::NoAliasViolation { .. })) { *passed += 1; guards.push("miri:noalias rejected overlapping &mut/& in region 1".into()); } else { fails.push("miri:noalias failed to catch overlap".into()); }
+    let sh = prog!("miri_shl64"; param x = Domain::range(0, 100); let o = Op::Shl(x, 64); out o;);
+    if matches!(verify_program(&sh, ArchProfile::X86_64Avx2, cfg), Err(VerifyError::ShiftOverflow { lo: 64, hi: 64, .. })) { *passed += 1; guards.push("miri:shift_ub rejected << 64 statically".into()); } else { fails.push("miri:shift_ub failed to catch << 64".into()); }
+    let dv = prog!("miri_div0_42"; param xd = Domain::range(0, 100_000); let c100 = Op::Const(100); let c42 = Op::Const(42); let sub = Op::Sub(xd, c42); let q = Op::Div(c100, sub); out q;);
+    if matches!(verify_program(&dv, ArchProfile::Aarch64Neon, cfg), Err(VerifyError::CounterexampleFound { inputs, .. }) if inputs == vec![42]) { *passed += 1; guards.push("miri:div0 ce=[42] isolated in [0..=100000]".into()); } else { fails.push("miri:div0 failed to catch x == 42".into()); }
+    let eg = prog!("miri_egraph"; buf tb = ("tbl", 16, false, 1, 0, Domain::range(0, 255)); param xe = Domain::range(0, 1000); let c12 = Op::Const(12); let sm = Op::Add(xe, c12); let df = Op::Sub(sm, xe); let ld = Op::Load { buf: tb, idx: df }; out ld;);
+    if matches!(verify_program(&eg, ArchProfile::Aarch64Neon, cfg), Ok(r) if r.abstract_report.status == ProofStatus::ProvenSafe) { inv.push("miri:egraph (x + 12) - x == 12 statically proven on x in 0..=1000".into()); }
 }
 
 fn check_asan_suite(inv: &mut Vec<String>, guards: &mut Vec<String>, fails: &mut Vec<String>, passed: &mut usize) {
-    // 4. ASan-class 1-byte OOB + guard synthesis.
-    let mut oob = Program::new("asan_oob16");
-    let b = oob.add_buf("arr", 16, false, 1, 0, Domain::range(0, 255));
-    let x = oob.add_param(Domain::range(0, 16));
-    let v = oob.push(Op::Load { buf: b, idx: x });
-    oob.add_output(v);
-    match prove_exhaustive(&oob, RefineConfig::default()) {
-        ProofVerdict::Counterexample { input, fault, synthesized_guard, .. }
-            if input == vec![16] && (fault & FAULT_OOB) != 0 && synthesized_guard == "p0 in 0..=15" =>
-        {
-            *passed += 1;
-            guards.push(format!("asan:oob16 fault={} ce={input:?} guard=({synthesized_guard})", fault_name(fault)));
+    let cfg = RefineConfig::default();
+    let oob = prog!("asan_oob16"; buf b = ("arr", 16, false, 1, 0, Domain::range(0, 255)); param x = Domain::range(0, 16); let v = Op::Load { buf: b, idx: x }; out v;);
+    match prove_exhaustive(&oob, cfg) {
+        ProofVerdict::Counterexample { input, fault, synthesized_guard, .. } if input == vec![16] && (fault & FAULT_OOB) != 0 && synthesized_guard == "p0 in 0..=15" => {
+            *passed += 1; guards.push(format!("asan:oob16 fault={} ce={input:?} guard=({synthesized_guard})", fault_name(fault)));
         }
         other => fails.push(format!("asan:oob16 unexpected verdict: {other:?}")),
     }
-
-    // 5. ASan-class Use-After-Free (static + 8-lane SIMD replay).
-    let mut uaf = Program::new("asan_uaf");
-    let bu = uaf.add_buf("heap", 16, true, 1, 0, Domain::range(0, 255));
-    let iu = uaf.add_param(Domain::range(0, 15));
-    uaf.push(Op::Free(bu));
-    let lu = uaf.push(Op::Load { buf: bu, idx: iu });
-    uaf.add_output(lu);
-    let uaf_static = verify_program(&uaf, ArchProfile::Aarch64Neon, RefineConfig::default());
-    let uaf_simd = eval_lanes_x8(&uaf, &[[0; LANES]]);
-    if let Err(VerifyError::UseAfterFree { buf, generation, .. }) = uaf_static {
-        if uaf_simd.faults.iter().all(|&f| (f & FAULT_UAF) != 0) {
-            *passed += 1;
-            guards.push(format!("asan:uaf fault=UseAfterFree buf={buf} gen={generation} simd_lanes=8/8"));
-        } else { fails.push("asan:uaf SIMD replay missed FAULT_UAF".to_string()); }
-    } else { fails.push(format!("asan:uaf static missed UAF: {uaf_static:?}")); }
-
-    // 6. ASan-class Double-Free (static + 8-lane SIMD replay).
-    let mut df = Program::new("asan_double_free");
-    let bd = df.add_buf("heap", 16, true, 1, 0, Domain::range(0, 255));
-    df.push(Op::Free(bd));
-    let f2 = df.push(Op::Free(bd));
-    df.add_output(f2);
-    let df_static = verify_program(&df, ArchProfile::Aarch64Neon, RefineConfig::default());
-    let df_simd = eval_lanes_x8(&df, &[]);
-    if let Err(VerifyError::DoubleFree { buf, generation, .. }) = df_static {
-        if df_simd.faults.iter().all(|&f| (f & FAULT_DOUBLE_FREE) != 0) {
-            *passed += 1;
-            guards.push(format!("asan:double_free fault=DoubleFree buf={buf} gen={generation} simd_lanes=8/8"));
-        } else { fails.push("asan:double_free SIMD replay missed FAULT_DOUBLE_FREE".to_string()); }
-    } else { fails.push(format!("asan:double_free static missed DoubleFree: {df_static:?}")); }
-
-    // 7. ASan-class Uninitialized-Read vs Store-before-Load (static + 8-lane SIMD replay).
-    let mut uninit = Program::new("asan_uninit");
-    let bn = uninit.add_uninit_buf("scratch", 16, true, 1, 0, Domain::range(0, 255));
-    let ix = uninit.add_param(Domain::range(0, 15));
-    let ln = uninit.push(Op::Load { buf: bn, idx: ix });
-    uninit.add_output(ln);
-    let mut init_ok = Program::new("asan_init_ok");
-    let bi = init_ok.add_uninit_buf("scratch", 16, true, 1, 0, Domain::range(0, 255));
-    let ii = init_ok.add_param(Domain::range(0, 15));
-    let cv = init_ok.push(Op::Const(7));
-    init_ok.push(Op::Store { buf: bi, idx: ii, val: cv });
-    let li = init_ok.push(Op::Load { buf: bi, idx: ii });
-    init_ok.add_output(li);
-    let u_bad = verify_program(&uninit, ArchProfile::Aarch64Neon, RefineConfig::default());
-    let u_ok = verify_program(&init_ok, ArchProfile::Aarch64Neon, RefineConfig::default());
-    let u_simd = eval_lanes_x8(&uninit, &[[0, 1, 2, 3, 4, 5, 6, 7]]);
-    if matches!(u_bad, Err(VerifyError::UninitializedRead { .. })) && u_ok.is_ok() && u_simd.faults.iter().all(|&f| (f & FAULT_UNINIT) != 0) {
-        *passed += 1;
-        inv.push("asan:init_mask store(buf[x]) -> load(buf[x]) proven initialized".to_string());
-        guards.push("asan:uninit fault=UninitializedRead buf=0 idx=[0..=15] simd_lanes=8/8".to_string());
-    } else { fails.push("asan:uninit knockout failed".to_string()); }
+    let uaf = prog!("asan_uaf"; buf bu = ("heap", 16, true, 1, 0, Domain::range(0, 255)); param iu = Domain::range(0, 15); do Op::Free(bu); let lu = Op::Load { buf: bu, idx: iu }; out lu;);
+    if let Err(VerifyError::UseAfterFree { buf, generation, .. }) = verify_program(&uaf, ArchProfile::Aarch64Neon, cfg) {
+        if eval_lanes_x8(&uaf, &[[0; LANES]]).faults.iter().all(|&f| (f & FAULT_UAF) != 0) { *passed += 1; guards.push(format!("asan:uaf fault=UseAfterFree buf={buf} gen={generation} simd_lanes=8/8")); }
+        else { fails.push("asan:uaf SIMD replay missed FAULT_UAF".into()); }
+    } else { fails.push("asan:uaf static missed UAF".into()); }
+    let df = prog!("asan_double_free"; buf bd = ("heap", 16, true, 1, 0, Domain::range(0, 255)); do Op::Free(bd); let f2 = Op::Free(bd); out f2;);
+    if let Err(VerifyError::DoubleFree { buf, generation, .. }) = verify_program(&df, ArchProfile::Aarch64Neon, cfg) {
+        if eval_lanes_x8(&df, &[]).faults.iter().all(|&f| (f & FAULT_DOUBLE_FREE) != 0) { *passed += 1; guards.push(format!("asan:double_free fault=DoubleFree buf={buf} gen={generation} simd_lanes=8/8")); }
+        else { fails.push("asan:double_free SIMD replay missed FAULT_DOUBLE_FREE".into()); }
+    } else { fails.push("asan:double_free static missed DoubleFree".into()); }
+    let uninit = prog!("asan_uninit"; uninit bn = ("scratch", 16, true, 1, 0, Domain::range(0, 255)); param ix = Domain::range(0, 15); let ln = Op::Load { buf: bn, idx: ix }; out ln;);
+    let init_ok = prog!("asan_init_ok"; uninit bi = ("scratch", 16, true, 1, 0, Domain::range(0, 255)); param ii = Domain::range(0, 15); let cv = Op::Const(7); do Op::Store { buf: bi, idx: ii, val: cv }; let li = Op::Load { buf: bi, idx: ii }; out li;);
+    if matches!(verify_program(&uninit, ArchProfile::Aarch64Neon, cfg), Err(VerifyError::UninitializedRead { .. }))
+        && verify_program(&init_ok, ArchProfile::Aarch64Neon, cfg).is_ok()
+        && eval_lanes_x8(&uninit, &[[0, 1, 2, 3, 4, 5, 6, 7]]).faults.iter().all(|&f| (f & FAULT_UNINIT) != 0)
+    {
+        *passed += 1; inv.push("asan:init_mask store(buf[x]) -> load(buf[x]) proven initialized".into());
+        guards.push("asan:uninit fault=UninitializedRead buf=0 idx=[0..=15] simd_lanes=8/8".into());
+    } else { fails.push("asan:uninit knockout failed".into()); }
 }
 
 fn check_kani_and_arch_suite(inv: &mut Vec<String>, guards: &mut Vec<String>, fails: &mut Vec<String>, passed: &mut usize) {
-    // 8. Kani-class exhaustive ProvenTotal on `(x * x) % 16` across `x in [0, 1000]` vs 1-point failure at `x == 777`.
-    let clean = build_quad_mod16_kernel(false);
-    let buggy = build_quad_mod16_kernel(true);
-    let v_clean = prove_exhaustive(&clean, RefineConfig::default());
-    let v_buggy = prove_exhaustive(&buggy, RefineConfig::default());
-    match (v_clean, v_buggy) {
-        (
-            ProofVerdict::ProvenTotal { boxes_discharged, learned_invariants },
-            ProofVerdict::Counterexample { input, fault, synthesized_guard, .. },
-        ) if boxes_discharged > 0 && input == vec![777] && synthesized_guard == "p0 in 0..=776 || p0 in 778..=1000" => {
-            *passed += 1;
-            inv.push(format!("kani:quad_mod16 ProvenTotal boxes={boxes_discharged} domain=[0..=1000]"));
+    let cfg = RefineConfig::default();
+    match (prove_exhaustive(&build_quad_mod16_kernel(false), cfg), prove_exhaustive(&build_quad_mod16_kernel(true), cfg)) {
+        (ProofVerdict::ProvenTotal { boxes_discharged, learned_invariants }, ProofVerdict::Counterexample { input, fault, synthesized_guard, .. })
+            if boxes_discharged > 0 && input == vec![777] && synthesized_guard == "p0 in 0..=776 || p0 in 778..=1000" =>
+        {
+            *passed += 1; inv.push(format!("kani:quad_mod16 ProvenTotal boxes={boxes_discharged} domain=[0..=1000]"));
             for li in learned_invariants { inv.push(format!("kani:quad_mod16 {li}")); }
             guards.push(format!("kani:quad_mod16_777 fault={} ce={input:?} guard=({synthesized_guard})", fault_name(fault)));
         }
         (vc, vb) => fails.push(format!("kani:quad_mod16 unexpected: clean={vc:?}, buggy={vb:?}")),
     }
-
-    // 9. Dual-architecture 20-live-reg AVX2 spill vs NEON pass guard.
-    let mut k20 = Program::new("arch_20reg");
-    k20.simd_lanes = 2;
-    for _ in 0..20 {
-        let p = k20.add_param(Domain::range(0, 1000));
-        k20.add_output(p);
-    }
-    let avx = verify_program(&k20, ArchProfile::X86_64Avx2, RefineConfig::default());
-    let neon = verify_program(&k20, ArchProfile::Aarch64Neon, RefineConfig::default());
-    if matches!(avx, Err(VerifyError::RegisterSpill { peak_gprs: 20, max_gprs: 14, .. })) && neon.is_ok() {
-        *passed += 1;
-        inv.push("arch:20reg avx2=spill(20/14) neon=pass(20/28,20/32)".to_string());
-    } else { fails.push("arch:20reg dual-arch spill knockout failed".to_string()); }
-
-    // 10. NTF1 causal airlock + zero-SVO + retro-causal completeness knockout.
-    let valid_ntf1 = "NTF1 airlock\n+t zero_cc -> zero_check\n+t zero_check -> Fault.Spill\n-t Fault.Spill <- Guard.Avx2\n0t zero_cc >< zero_check\n";
-    let svo_ntf1 = "NTF1 airlock\n# this is prose\n+t a -> b\n";
-    let uncov_ntf1 = "NTF1 airlock\n+t a -> Fault.Leak\n";
-    let ok = verify_ntf1_source("inline.ntf1", valid_ntf1);
-    let bad_svo = verify_ntf1_source("svo.ntf1", svo_ntf1);
-    let bad_cov = verify_ntf1_source("uncov.ntf1", uncov_ntf1);
-    if matches!(ok, Ok(ref r) if r.canonical_idempotent && r.faults_covered == 1)
-        && matches!(bad_svo, Err(Ntf1Error::SvoTax { .. }))
-        && matches!(bad_cov, Err(Ntf1Error::UncoveredFault { .. }))
-    {
-        *passed += 1;
-        inv.push("ntf1:airlock canonical_idempotent=true faults_covered=1".to_string());
-        guards.push("ntf1:svo_and_retro rejected SVO prose and uncovered Fault.Leak".to_string());
-    } else { fails.push("ntf1:airlock knockout failed".to_string()); }
-
-    // 11. Raw `.rs` frontend semantic verifier + --kernel-strict zero-panic gate.
-    let rs_clean = "/// @domain x: 0..=1000\npub fn lut_ok(x: i64, tbl: &[i64; 10]) -> i64 { tbl[((x * x) % 16) as usize] }\n";
-    let rs_buggy = "/// @domain x: 0..=1000\npub fn lut_bad(x: i64, tbl: &[i64; 10]) -> i64 { tbl[((x * x) % 16) as usize] / (x - 777) }\n";
+    let mut k20 = Program::new("arch_20reg"); k20.simd_lanes = 2;
+    for _ in 0..20 { let p = k20.add_param(Domain::range(0, 1000)); k20.add_output(p); }
+    if matches!(verify_program(&k20, ArchProfile::X86_64Avx2, cfg), Err(VerifyError::RegisterSpill { peak_gprs: 20, max_gprs: 14, .. })) && verify_program(&k20, ArchProfile::Aarch64Neon, cfg).is_ok() {
+        *passed += 1; inv.push("arch:20reg avx2=spill(20/14) neon=pass(20/28,20/32)".into());
+    } else { fails.push("arch:20reg dual-arch spill knockout failed".into()); }
+    let ok = verify_ntf1_source("inline.ntf1", "NTF1 airlock\n+t zero_cc -> zero_check\n+t zero_check -> Fault.Spill\n-t Fault.Spill <- Guard.Avx2\n0t zero_cc >< zero_check\n");
+    let bad_svo = verify_ntf1_source("svo.ntf1", "NTF1 airlock\n# this is prose\n+t a -> b\n");
+    let bad_cov = verify_ntf1_source("uncov.ntf1", "NTF1 airlock\n+t a -> Fault.Leak\n");
+    if matches!(ok, Ok(ref r) if r.canonical_idempotent && r.faults_covered == 1) && matches!(bad_svo, Err(Ntf1Error::SvoTax { .. })) && matches!(bad_cov, Err(Ntf1Error::UncoveredFault { .. })) {
+        *passed += 1; inv.push("ntf1:airlock canonical_idempotent=true faults_covered=1".into());
+        guards.push("ntf1:svo_and_retro rejected SVO prose and uncovered Fault.Leak".into());
+    } else { fails.push("ntf1:airlock knockout failed".into()); }
+    let rs_ok = "/// @domain x: 0..=1000\npub fn lut_ok(x: i64, tbl: &[i64; 10]) -> i64 { tbl[((x * x) % 16) as usize] }\n";
+    let rs_bad = "/// @domain x: 0..=1000\npub fn lut_bad(x: i64, tbl: &[i64; 10]) -> i64 { tbl[((x * x) % 16) as usize] / (x - 777) }\n";
     let rs_panic = "pub fn bad_k(x: Option<i64>) -> i64 { x.unwrap() }\n";
-    let rep_ok = verify_kernel_rust_source("ok.rs", rs_clean, ArchProfile::X86_64Avx2, RefineConfig::default());
-    let rep_bad = verify_rust_functions("bad.rs", rs_buggy, ArchProfile::X86_64Avx2, RefineConfig::default());
-    let rep_panic = verify_kernel_rust_source("panic.rs", rs_panic, ArchProfile::X86_64Avx2, RefineConfig::default());
-    let caught_777 = matches!(rep_bad.failed.first().map(|f| &f.error), Some(VerifyError::CounterexampleFound { inputs, .. }) if inputs == &vec![777]);
-    let caught_panic = matches!(rep_panic, Err(VerifyError::LintViolations { count: 1 }))
-        && crate::scan_rust_source("panic.rs", rs_panic).findings.iter().any(|f| f.kind == LintKind::PanicCall);
-    if rep_ok.is_ok() && caught_777 && caught_panic {
-        *passed += 1;
-        inv.push("rust_fe:lut_ok ProvenTotal directly from .rs source".to_string());
-        guards.push("rust_fe:div0_777_and_kernel_panic rejected x==777 and .unwrap()".to_string());
-    } else { fails.push("rust_fe:raw .rs semantic knockout failed".to_string()); }
+    let caught_777 = matches!(verify_rust_functions("bad.rs", rs_bad, ArchProfile::X86_64Avx2, cfg).failed.first().map(|f| &f.error), Some(VerifyError::CounterexampleFound { inputs, .. }) if inputs == &vec![777]);
+    let caught_panic = matches!(verify_kernel_rust_source("panic.rs", rs_panic, ArchProfile::X86_64Avx2, cfg), Err(VerifyError::LintViolations { count: 1 })) && crate::scan_rust_source("panic.rs", rs_panic).findings.iter().any(|f| f.kind == LintKind::PanicCall);
+    if verify_kernel_rust_source("ok.rs", rs_ok, ArchProfile::X86_64Avx2, cfg).is_ok() && caught_777 && caught_panic {
+        *passed += 1; inv.push("rust_fe:lut_ok ProvenTotal directly from .rs source".into());
+        guards.push("rust_fe:div0_777_and_kernel_panic rejected x==777 and .unwrap()".into());
+    } else { fails.push("rust_fe:raw .rs semantic knockout failed".into()); }
 }
 
 /// Run the full Miri-class + ASan-class + Kani-class + AVX2/NEON + NTF1 + Rust-FE self-verification gauntlet.
-#[must_use]
-pub fn run_gauntlet() -> GauntletSummary {
+#[must_use] pub fn run_gauntlet() -> GauntletSummary {
     let (mut inv, mut guards, mut fails, mut passed) = (Vec::new(), Vec::new(), Vec::new(), 0usize);
     check_miri_suite(&mut inv, &mut guards, &mut fails, &mut passed);
     check_asan_suite(&mut inv, &mut guards, &mut fails, &mut passed);
     check_kani_and_arch_suite(&mut inv, &mut guards, &mut fails, &mut passed);
-    GauntletSummary {
-        checks_passed: passed, checks_total: 11,
-        proven_invariants: inv, learned_guards: guards, failures: fails,
-    }
+    GauntletSummary { checks_passed: passed, checks_total: 11, proven_invariants: inv, learned_guards: guards, failures: fails }
 }
 
 /// Zero-dependency autopoietic JSON ledger persisting proven invariants and learned guards across runs.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct AutopoieticLedger {
-    pub epochs: u64,
-    pub crates_verified: usize,
-    pub files_scanned: usize,
-    pub lines_scanned: usize,
-    pub lint_errors: usize,
-    pub lint_warnings: usize,
-    pub gauntlet_passed: usize,
-    pub gauntlet_total: usize,
-    pub elapsed_us: u64,
-    pub proven_invariants: BTreeSet<String>,
-    pub learned_guards: BTreeSet<String>,
+    pub epochs: u64, pub crates_verified: usize, pub files_scanned: usize, pub lines_scanned: usize,
+    pub lint_errors: usize, pub lint_warnings: usize, pub gauntlet_passed: usize, pub gauntlet_total: usize,
+    pub elapsed_us: u64, pub proven_invariants: BTreeSet<String>, pub learned_guards: BTreeSet<String>,
 }
 
 fn json_escape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('"');
+    let mut out = String::with_capacity(s.len() + 2); out.push('"');
     for b in s.bytes() {
-        match b {
-            b'"' => out.push_str("\\\""),
-            b'\\' => out.push_str("\\\\"),
-            b'\n' => out.push_str("\\n"),
-            b'\r' => out.push_str("\\r"),
-            b'\t' => out.push_str("\\t"),
-            0x20..=0x7E => out.push(b as char),
-            other => out.push_str(&format!("\\u00{other:02x}")),
-        }
+        match b { b'"' => out.push_str("\\\""), b'\\' => out.push_str("\\\\"), b'\n' => out.push_str("\\n"), b'\r' => out.push_str("\\r"), b'\t' => out.push_str("\\t"), 0x20..=0x7E => out.push(b as char), o => out.push_str(&format!("\\u00{o:02x}")) }
     }
-    out.push('"');
-    out
+    out.push('"'); out
 }
 
 fn json_unescape(raw: &str) -> String {
-    let bytes = raw.as_bytes();
-    let (mut out, mut i) = (String::with_capacity(bytes.len()), 0usize);
+    let (bytes, mut out, mut i) = (raw.as_bytes(), String::with_capacity(raw.len()), 0usize);
     while i < bytes.len() {
-        if bytes[i] == b'\\' && i + 1 < bytes.len() {
-            match bytes[i + 1] {
-                b'"' => out.push('"'),
-                b'\\' => out.push('\\'),
-                b'n' => out.push('\n'),
-                b'r' => out.push('\r'),
-                b't' => out.push('\t'),
-                other => out.push(other as char),
-            }
-            i += 2;
-        } else {
-            out.push(bytes[i] as char);
-            i += 1;
-        }
+        if bytes[i] == b'\\' && i + 1 < bytes.len() { out.push(match bytes[i + 1] { b'"' => '"', b'\\' => '\\', b'n' => '\n', b'r' => '\r', b't' => '\t', o => o as char }); i += 2; }
+        else { out.push(bytes[i] as char); i += 1; }
     }
     out
 }
 
 fn parse_u64_field(src: &str, key: &str) -> Option<u64> {
     let needle = format!("\"{key}\"");
-    let pos = src.find(&needle)? + needle.len();
-    let rest = src[pos..].trim_start().strip_prefix(':')?.trim_start();
-    let end = rest.bytes().take_while(u8::is_ascii_digit).count();
-    rest[..end].parse::<u64>().ok()
+    let rest = src[src.find(&needle)? + needle.len()..].trim_start().strip_prefix(':')?.trim_start();
+    rest[..rest.bytes().take_while(u8::is_ascii_digit).count()].parse().ok()
 }
 
 fn parse_string_array(src: &str, key: &str) -> Vec<String> {
@@ -318,19 +156,13 @@ fn parse_string_array(src: &str, key: &str) -> Vec<String> {
     let Some(pos) = src.find(&needle) else { return Vec::new(); };
     let rest = &src[pos + needle.len()..];
     let Some(lb) = rest.find('[') else { return Vec::new(); };
-    let bytes = &rest.as_bytes()[lb + 1..];
-    let (mut out, mut i) = (Vec::new(), 0usize);
+    let (bytes, mut out, mut i) = (&rest.as_bytes()[lb + 1..], Vec::new(), 0usize);
     while i < bytes.len() {
         match bytes[i] {
             b']' => break,
             b'"' => {
-                i += 1;
-                let start = i;
-                while i < bytes.len() {
-                    if bytes[i] == b'\\' && i + 1 < bytes.len() { i += 2; }
-                    else if bytes[i] == b'"' { break; }
-                    else { i += 1; }
-                }
+                i += 1; let start = i;
+                while i < bytes.len() { if bytes[i] == b'\\' && i + 1 < bytes.len() { i += 2; } else if bytes[i] == b'"' { break; } else { i += 1; } }
                 if i < bytes.len() { out.push(json_unescape(&rest[lb + 1 + start..lb + 1 + i])); i += 1; }
             }
             _ => i += 1,
@@ -340,58 +172,21 @@ fn parse_string_array(src: &str, key: &str) -> Vec<String> {
 }
 
 impl AutopoieticLedger {
-    #[must_use]
-    pub fn from_json(src: &str) -> Self {
-        Self {
-            epochs: parse_u64_field(src, "epochs").unwrap_or(0),
-            proven_invariants: parse_string_array(src, "proven_invariants").into_iter().collect(),
-            learned_guards: parse_string_array(src, "learned_guards").into_iter().collect(),
-            ..Self::default()
-        }
+    #[must_use] pub fn from_json(src: &str) -> Self {
+        Self { epochs: parse_u64_field(src, "epochs").unwrap_or(0), proven_invariants: parse_string_array(src, "proven_invariants").into_iter().collect(), learned_guards: parse_string_array(src, "learned_guards").into_iter().collect(), ..Self::default() }
     }
-
-    #[must_use]
-    pub fn load_or_new(path: &Path) -> Self {
-        fs::read_to_string(path).map(|s| Self::from_json(&s)).unwrap_or_default()
-    }
-
+    #[must_use] pub fn load_or_new(path: &Path) -> Self { fs::read_to_string(path).map(|s| Self::from_json(&s)).unwrap_or_default() }
     pub fn absorb_invariants(&mut self, invariants: impl IntoIterator<Item = String>, guards: impl IntoIterator<Item = String>) {
-        self.epochs = self.epochs.saturating_add(1);
-        self.proven_invariants.extend(invariants);
-        self.learned_guards.extend(guards);
+        self.epochs = self.epochs.saturating_add(1); self.proven_invariants.extend(invariants); self.learned_guards.extend(guards);
     }
-
-    #[must_use]
-    pub fn to_json(&self) -> String {
-        let fmt_arr = |set: &BTreeSet<String>| -> String {
-            if set.is_empty() { return "[]".to_string(); }
-            let items: Vec<String> = set.iter().map(|s| format!("    {}", json_escape(s))).collect();
-            format!("[\n{}\n  ]", items.join(",\n"))
-        };
+    #[must_use] pub fn to_json(&self) -> String {
+        let fmt_arr = |set: &BTreeSet<String>| if set.is_empty() { "[]".to_string() } else { format!("[\n{}\n  ]", set.iter().map(|s| format!("    {}", json_escape(s))).collect::<Vec<_>>().join(",\n")) };
         format!(
-            concat!(
-                "{{\n",
-                "  \"schema\": \"zero-check.autopoietic/v2\",\n",
-                "  \"epochs\": {},\n",
-                "  \"crates_verified\": {},\n",
-                "  \"files_scanned\": {},\n",
-                "  \"lines_scanned\": {},\n",
-                "  \"lint_errors\": {},\n",
-                "  \"lint_warnings\": {},\n",
-                "  \"gauntlet_passed\": {},\n",
-                "  \"gauntlet_total\": {},\n",
-                "  \"elapsed_us\": {},\n",
-                "  \"proven_invariants\": {},\n",
-                "  \"learned_guards\": {}\n",
-                "}}\n"
-            ),
-            self.epochs, self.crates_verified, self.files_scanned, self.lines_scanned,
-            self.lint_errors, self.lint_warnings, self.gauntlet_passed, self.gauntlet_total,
-            self.elapsed_us, fmt_arr(&self.proven_invariants), fmt_arr(&self.learned_guards),
+            "{{\n  \"schema\": \"zero-check.autopoietic/v2\",\n  \"epochs\": {},\n  \"crates_verified\": {},\n  \"files_scanned\": {},\n  \"lines_scanned\": {},\n  \"lint_errors\": {},\n  \"lint_warnings\": {},\n  \"gauntlet_passed\": {},\n  \"gauntlet_total\": {},\n  \"elapsed_us\": {},\n  \"proven_invariants\": {},\n  \"learned_guards\": {}\n}}\n",
+            self.epochs, self.crates_verified, self.files_scanned, self.lines_scanned, self.lint_errors,
+            self.lint_warnings, self.gauntlet_passed, self.gauntlet_total, self.elapsed_us,
+            fmt_arr(&self.proven_invariants), fmt_arr(&self.learned_guards),
         )
     }
-
-    pub fn save(&self, path: &Path) -> Result<(), VerifyError> {
-        fs::write(path, self.to_json()).map_err(|e| VerifyError::Io(format!("{}: {e}", path.display())))
-    }
+    pub fn save(&self, path: &Path) -> Result<(), VerifyError> { fs::write(path, self.to_json()).map_err(|e| VerifyError::Io(format!("{}: {e}", path.display()))) }
 }

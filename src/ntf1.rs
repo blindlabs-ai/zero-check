@@ -1,5 +1,5 @@
 use std::collections::BTreeSet;
-use std::{fmt, fs, path::Path};
+use std::{fs, path::Path};
 use crate::abstract_eval::VerifyError;
 
 const SVO_WORDS: &[&str] = &["the", "is", "are", "was", "were", "this", "that", "should", "must", "we", "our"];
@@ -10,27 +10,17 @@ pub enum Ntf1Kind { Forward, Retro, Airlock, Pipe }
 pub struct Ntf1Stmt { pub line: usize, pub kind: Ntf1Kind, pub lhs: Vec<String>, pub rhs: Vec<String> }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Ntf1Doc { pub module: Option<String>, pub stmts: Vec<Ntf1Stmt> }
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Ntf1Error {
-    NonAscii { line: usize, col: usize }, MissingHeader, SvoTax { line: usize, word: String },
-    Syntax { line: usize, detail: String }, DanglingMorphism { line: usize },
-    UncoveredFault { fault: String }, BrokenAirlock { line: usize, detail: String }, EmptySpec,
-}
-impl fmt::Display for Ntf1Error {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::NonAscii { line, col } => write!(f, "ntf1 non-ASCII byte at {line}:{col}"),
-            Self::MissingHeader => write!(f, "ntf1 missing NTF1 header"),
-            Self::SvoTax { line, word } => write!(f, "ntf1 SVO grammar tax at line {line}: '{word}'"),
-            Self::Syntax { line, detail } => write!(f, "ntf1 syntax error at line {line}: {detail}"),
-            Self::DanglingMorphism { line } => write!(f, "ntf1 dangling morphism at line {line}"),
-            Self::UncoveredFault { fault } => write!(f, "ntf1 uncovered fault without -t trap: {fault}"),
-            Self::BrokenAirlock { line, detail } => write!(f, "ntf1 broken 0t airlock at line {line}: {detail}"),
-            Self::EmptySpec => write!(f, "ntf1 spec contains zero statements"),
-        }
-    }
-}
-impl std::error::Error for Ntf1Error {}
+
+crate::define_errors!(pub Ntf1Error {
+    NonAscii { line: usize, col: usize } => ("ntf1 non-ASCII byte at {line}:{col}"),
+    MissingHeader => ("ntf1 missing NTF1 header"),
+    SvoTax { line: usize, word: String } => ("ntf1 SVO grammar tax at line {line}: '{word}'"),
+    Syntax { line: usize, detail: String } => ("ntf1 syntax error at line {line}: {detail}"),
+    DanglingMorphism { line: usize } => ("ntf1 dangling morphism at line {line}"),
+    UncoveredFault { fault: String } => ("ntf1 uncovered fault without -t trap: {fault}"),
+    BrokenAirlock { line: usize, detail: String } => ("ntf1 broken 0t airlock at line {line}: {detail}"),
+    EmptySpec => ("ntf1 spec contains zero statements"),
+});
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Ntf1Report {
@@ -40,8 +30,8 @@ pub struct Ntf1Report {
 
 fn is_valid_atom(s: &str) -> bool {
     if s.is_empty() || matches!(s, "+t" | "-t" | "0t" | "->" | "<-" | "><" | "|>") { return false; }
-    if s.len() >= 2 && s.starts_with('"') && s.ends_with('"') { return true; }
-    s.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b':' | b'/' | b'@' | b'=' | b'-'))
+    (s.len() >= 2 && s.starts_with('"') && s.ends_with('"'))
+        || s.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b':' | b'/' | b'@' | b'=' | b'-'))
 }
 
 /// Reject English SVO filler words outside `"..."` literals (including inside `#` comments).
@@ -55,8 +45,7 @@ pub fn check_svo_tax(src: &str) -> Result<(), Ntf1Error> {
                 i += 1;
             } else if b[i] == b'"' { q = true; i += 1; }
             else if b[i].is_ascii_alphabetic() || b[i] == b'_' {
-                let s = i;
-                while i < n && (b[i].is_ascii_alphanumeric() || b[i] == b'_') { i += 1; }
+                let s = i; while i < n && (b[i].is_ascii_alphanumeric() || b[i] == b'_') { i += 1; }
                 if SVO_WORDS.contains(&raw[s..i].to_ascii_lowercase().as_str()) {
                     return Err(Ntf1Error::SvoTax { line: idx + 1, word: raw[s..i].to_string() });
                 }
@@ -69,16 +58,12 @@ pub fn check_svo_tax(src: &str) -> Result<(), Ntf1Error> {
 fn split_line_stmts(raw: &str) -> Vec<&str> {
     let (b, n, mut i, mut q, mut seg_s, mut out) = (raw.as_bytes(), raw.len(), 0usize, false, 0usize, Vec::new());
     while i < n {
-        if q {
-            if b[i] == b'\\' && i + 1 < n { i += 2; continue; }
-            if b[i] == b'"' { q = false; }
-        } else if b[i] == b'"' { q = true; }
-        else if b[i] == b'#' { break; }
+        if q { if b[i] == b'\\' && i + 1 < n { i += 2; continue; } else if b[i] == b'"' { q = false; } }
+        else if b[i] == b'"' { q = true; } else if b[i] == b'#' { break; }
         else if b[i] == b';' { out.push(raw[seg_s..i].trim()); seg_s = i + 1; }
         i += 1;
     }
-    out.push(raw[seg_s..i].trim());
-    out
+    out.push(raw[seg_s..i].trim()); out
 }
 
 fn tokenize_seg(seg: &str, line: usize) -> Result<Vec<String>, Ntf1Error> {
@@ -88,8 +73,7 @@ fn tokenize_seg(seg: &str, line: usize) -> Result<Vec<String>, Ntf1Error> {
         if i >= n { break; }
         let s = i;
         if b[i] == b'"' {
-            i += 1;
-            while i < n && b[i] != b'"' { i += if b[i] == b'\\' && i + 1 < n { 2 } else { 1 }; }
+            i += 1; while i < n && b[i] != b'"' { i += if b[i] == b'\\' && i + 1 < n { 2 } else { 1 }; }
             if i >= n { return Err(Ntf1Error::Syntax { line, detail: "unterminated quote".into() }); }
             i += 1;
         } else { while i < n && !b[i].is_ascii_whitespace() { i += 1; } }
@@ -99,17 +83,13 @@ fn tokenize_seg(seg: &str, line: usize) -> Result<Vec<String>, Ntf1Error> {
 }
 
 fn parse_pipe(toks: &[String], line: usize) -> Result<Vec<String>, Ntf1Error> {
-    if toks.is_empty() || toks.len() % 2 == 0 {
-        return Err(Ntf1Error::Syntax { line, detail: "malformed pipeline".into() });
-    }
+    if toks.is_empty() || toks.len() % 2 == 0 { return Err(Ntf1Error::Syntax { line, detail: "malformed pipeline".into() }); }
     let mut out = Vec::with_capacity(toks.len().div_ceil(2));
     for (idx, t) in toks.iter().enumerate() {
         if idx % 2 == 0 {
             if !is_valid_atom(t) { return Err(Ntf1Error::Syntax { line, detail: format!("invalid atom '{t}'") }); }
             out.push(t.clone());
-        } else if t != "|>" {
-            return Err(Ntf1Error::Syntax { line, detail: format!("expected '|>' got '{t}'") });
-        }
+        } else if t != "|>" { return Err(Ntf1Error::Syntax { line, detail: format!("expected '|>' got '{t}'") }); }
     }
     Ok(out)
 }
@@ -117,9 +97,7 @@ fn parse_pipe(toks: &[String], line: usize) -> Result<Vec<String>, Ntf1Error> {
 /// Parse 7-bit ASCII NTF1 v1 source into a validated AST.
 pub fn parse_ntf1(src: &str) -> Result<Ntf1Doc, Ntf1Error> {
     for (idx, raw) in src.lines().enumerate() {
-        if let Some(col) = raw.as_bytes().iter().position(|&c| c >= 0x80) {
-            return Err(Ntf1Error::NonAscii { line: idx + 1, col: col + 1 });
-        }
+        if let Some(col) = raw.as_bytes().iter().position(|&c| c >= 0x80) { return Err(Ntf1Error::NonAscii { line: idx + 1, col: col + 1 }); }
     }
     check_svo_tax(src)?;
     let (mut saw_header, mut module, mut stmts) = (false, None, Vec::new());
@@ -134,16 +112,12 @@ pub fn parse_ntf1(src: &str) -> Result<Ntf1Doc, Ntf1Error> {
                     if !is_valid_atom(m) { return Err(Ntf1Error::Syntax { line, detail: format!("bad header '{m}'") }); }
                     module = Some(m.clone());
                 }
-                saw_header = true;
-                continue;
+                saw_header = true; continue;
             }
             match toks[0].as_str() {
                 "+t" | "-t" | "0t" => {
-                    let (kind, sep) = match toks[0].as_str() {
-                        "+t" => (Ntf1Kind::Forward, "->"), "-t" => (Ntf1Kind::Retro, "<-"), _ => (Ntf1Kind::Airlock, "><"),
-                    };
-                    let mk_err = || if kind == Ntf1Kind::Airlock { Ntf1Error::BrokenAirlock { line, detail: "0t requires ><".into() } }
-                        else { Ntf1Error::DanglingMorphism { line } };
+                    let (kind, sep) = match toks[0].as_str() { "+t" => (Ntf1Kind::Forward, "->"), "-t" => (Ntf1Kind::Retro, "<-"), _ => (Ntf1Kind::Airlock, "><") };
+                    let mk_err = || if kind == Ntf1Kind::Airlock { Ntf1Error::BrokenAirlock { line, detail: "0t requires ><".into() } } else { Ntf1Error::DanglingMorphism { line } };
                     let pos = toks[1..].iter().position(|t| t == sep).ok_or_else(mk_err)?;
                     let (lt, rt) = (&toks[1..1 + pos], &toks[2 + pos..]);
                     if lt.is_empty() || rt.is_empty() { return Err(mk_err()); }
@@ -186,32 +160,22 @@ pub fn verify_ntf1_source(file: &str, src: &str) -> Result<Ntf1Report, Ntf1Error
         for a in s.lhs.iter().chain(s.rhs.iter()) { if a.starts_with("Fault.") { faults_seen.insert(a.as_str()); } }
         match s.kind {
             Ntf1Kind::Forward => { fwd += 1; grounded.extend(s.lhs.iter().chain(s.rhs.iter()).map(String::as_str)); }
-            Ntf1Kind::Retro => {
-                ret += 1;
-                faults_guarded.extend(s.lhs.iter().map(String::as_str));
-                grounded.extend(s.lhs.iter().chain(s.rhs.iter()).map(String::as_str));
-            }
+            Ntf1Kind::Retro => { ret += 1; faults_guarded.extend(s.lhs.iter().map(String::as_str)); grounded.extend(s.lhs.iter().chain(s.rhs.iter()).map(String::as_str)); }
             Ntf1Kind::Pipe => { pip += 1; grounded.extend(s.lhs.iter().map(String::as_str)); }
             Ntf1Kind::Airlock => { air += 1; }
         }
     }
-    for f in &faults_seen {
-        if !faults_guarded.contains(f) { return Err(Ntf1Error::UncoveredFault { fault: (*f).to_string() }); }
-    }
+    for f in &faults_seen { if !faults_guarded.contains(f) { return Err(Ntf1Error::UncoveredFault { fault: (*f).to_string() }); } }
     for s in &doc.stmts {
-        if s.kind == Ntf1Kind::Airlock && s.lhs != s.rhs {
-            let ok = s.lhs.iter().all(|a| grounded.contains(a.as_str())) && s.rhs.iter().all(|a| grounded.contains(a.as_str()));
-            if !ok { return Err(Ntf1Error::BrokenAirlock { line: s.line, detail: "ungrounded airlock endpoint".into() }); }
-        }
+        if s.kind == Ntf1Kind::Airlock && s.lhs != s.rhs
+            && (!s.lhs.iter().all(|a| grounded.contains(a.as_str())) || !s.rhs.iter().all(|a| grounded.contains(a.as_str())))
+        { return Err(Ntf1Error::BrokenAirlock { line: s.line, detail: "ungrounded airlock endpoint".into() }); }
     }
     let reparsed = parse_ntf1(&emit_ntf1(&doc))?;
     let same = reparsed.module == doc.module && reparsed.stmts.len() == doc.stmts.len()
         && reparsed.stmts.iter().zip(&doc.stmts).all(|(a, b)| a.kind == b.kind && a.lhs == b.lhs && a.rhs == b.rhs);
     if !same { return Err(Ntf1Error::BrokenAirlock { line: 1, detail: "non-idempotent canonical emit".into() }); }
-    Ok(Ntf1Report {
-        file: file.to_string(), module: doc.module, forward_count: fwd, retro_count: ret,
-        airlock_count: air, pipe_count: pip, faults_covered: faults_seen.len(), canonical_idempotent: same,
-    })
+    Ok(Ntf1Report { file: file.to_string(), module: doc.module, forward_count: fwd, retro_count: ret, airlock_count: air, pipe_count: pip, faults_covered: faults_seen.len(), canonical_idempotent: same })
 }
 
 /// Read and verify an `.ntf1` spec file on disk.

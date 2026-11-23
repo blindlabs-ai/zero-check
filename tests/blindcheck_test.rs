@@ -30,8 +30,8 @@ fn bench_live_real_crates_sub_10ms() {
     let self_rep = verify_crate_dir(&self_src).expect("zero-check/src must self-verify cleanly");
     assert_eq!(self_rep.error_count(), 0, "self had errors: {:?}", self_rep.findings);
     assert!(
-        self_rep.lines_scanned <= 3000,
-        "src LOC must be <= 3000, got {}",
+        self_rep.lines_scanned <= 2550,
+        "src LOC must be <= 2550, got {}",
         self_rep.lines_scanned
     );
 
@@ -924,29 +924,37 @@ fn knockout_13_lint_expect_path_clamp_and_unused_prop() {
     assert!(r_uprop.findings.iter().any(|f| f.kind == LintKind::UnusedProp));
 
     // Self src/ and sibling zero-cc/src/ must have 0 errors and 0 UnusedProp findings.
-    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let self_rep = verify_crate_dir(&manifest_dir.join("src")).expect("zero-check/src clean");
-    assert!(self_rep.lines_scanned <= 3000, "zero-check/src LOC {} > 3000", self_rep.lines_scanned);
-    assert!(!self_rep.findings.iter().any(|f| f.kind == LintKind::UnusedProp));
-    let sib_cc = manifest_dir.parent().unwrap_or(manifest_dir).join("zero-cc").join("src");
-    if sib_cc.is_dir() {
-        let cc_rep = verify_crate_dir(&sib_cc).expect("zero-cc/src clean");
-        assert!(!cc_rep.findings.iter().any(|f| f.kind == LintKind::UnusedProp));
+    #[cfg(not(miri))]
+    {
+        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let self_rep = verify_crate_dir(&manifest_dir.join("src")).expect("zero-check/src clean");
+        assert!(self_rep.lines_scanned <= 2550, "zero-check/src LOC {} > 2550", self_rep.lines_scanned);
+        assert!(!self_rep.findings.iter().any(|f| f.kind == LintKind::UnusedProp));
+        let sib_cc = manifest_dir.parent().unwrap_or(manifest_dir).join("zero-cc").join("src");
+        if sib_cc.is_dir() {
+            let cc_rep = verify_crate_dir(&sib_cc).expect("zero-cc/src clean");
+            assert!(!cc_rep.findings.iter().any(|f| f.kind == LintKind::UnusedProp));
+        }
     }
 }
 
 #[test]
 fn knockout_14_ntf1_airlock_svo_and_coevolution() {
-    use zero_check::{emit_ntf1, parse_ntf1, verify_ntf1_file, verify_ntf1_source, Ntf1Error};
+    use zero_check::{emit_ntf1, parse_ntf1, verify_ntf1_source, Ntf1Error};
 
-    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let self_spec_path = manifest_dir.join("specs").join("zero_check.ntf1");
-    let self_src = std::fs::read_to_string(&self_spec_path).expect("read specs/zero_check.ntf1");
-    let self_rep = verify_ntf1_file(&self_spec_path).expect("specs/zero_check.ntf1 must pass");
+    let self_src = include_str!("../specs/zero_check.ntf1");
+    let self_rep = verify_ntf1_source("zero_check.ntf1", self_src).expect("specs/zero_check.ntf1 must pass");
+    #[cfg(not(miri))]
+    {
+        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let self_spec_path = manifest_dir.join("specs").join("zero_check.ntf1");
+        let file_rep = zero_check::verify_ntf1_file(&self_spec_path).expect("specs/zero_check.ntf1 file must pass");
+        assert_eq!((file_rep.forward_count, file_rep.retro_count, file_rep.faults_covered), (self_rep.forward_count, self_rep.retro_count, self_rep.faults_covered));
+    }
     assert!(self_rep.canonical_idempotent);
     assert!(self_rep.forward_count >= 5 && self_rep.retro_count >= 5 && self_rep.airlock_count >= 2);
     assert!(self_rep.faults_covered >= 6);
-    let canon1 = emit_ntf1(&parse_ntf1(&self_src).expect("parse self spec"));
+    let canon1 = emit_ntf1(&parse_ntf1(self_src).expect("parse self spec"));
     let canon2 = emit_ntf1(&parse_ntf1(&canon1).expect("reparse canonical"));
     assert_eq!(canon1, canon2, "emit_ntf1(parse_ntf1(s)) must be an exact fixed-point");
 
@@ -961,7 +969,7 @@ fn knockout_14_ntf1_airlock_svo_and_coevolution() {
     let ok_0t_full_pipe = "NTF1 ok\n+t a -> b\n0t a |> b >< b\n";
     let non_ascii = "NTF1 bad\n# caf\u{00e9}\n+t a -> b\n";
 
-    let ok_res = verify_ntf1_source("zero_check.ntf1", &self_src);
+    let ok_res = verify_ntf1_source("zero_check.ntf1", self_src);
     let r_svo1 = verify_ntf1_source("svo1.ntf1", svo_code);
     let r_svo2 = verify_ntf1_source("svo2.ntf1", svo_comment);
     let r_dang = verify_ntf1_source("dang.ntf1", dangling);
@@ -992,11 +1000,12 @@ fn knockout_14_ntf1_airlock_svo_and_coevolution() {
     // Cross-crate NTF1 + Rust co-evolution check when ../zero-cc is present (< 25 ms).
     #[cfg(not(miri))]
     {
+        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
         let sib_root = manifest_dir.parent().unwrap_or(manifest_dir).join("zero-cc");
         let sib_spec = sib_root.join("specs").join("zero_cc.ntf1");
         if sib_spec.is_file() {
             let t0 = std::time::Instant::now();
-            let cc_ntf1 = verify_ntf1_file(&sib_spec).expect("../zero-cc/specs/zero_cc.ntf1 must pass");
+            let cc_ntf1 = zero_check::verify_ntf1_file(&sib_spec).expect("../zero-cc/specs/zero_cc.ntf1 must pass");
             let cc_lint = verify_crate_dir(&sib_root.join("src")).expect("../zero-cc/src must pass");
             let elapsed_ms = (t0.elapsed().as_micros() as f64) / 1000.0;
             assert!(cc_ntf1.canonical_idempotent);
@@ -1117,4 +1126,173 @@ fn knockout_15_raw_rs_semantic_verifier_and_kernel_strict() {
         assert!(!out_bad.status.success(), "CLI bad.rs must exit non-zero");
         assert!(String::from_utf8_lossy(&out_bad.stderr).contains("777"));
     }
+}
+
+#[test]
+fn knockout_16_live_miri_head_to_head_and_guarded_branches() {
+    use zero_check::verify_rust_functions;
+
+    // (a) Live Miri head-to-head on a standalone 0-dep crate: Miri passes partial unit tests (exit 0),
+    // while zero-check proves all 4 latent UB paths in < 10 ms (exit 1) and passes the patched crate (exit 0).
+    #[cfg(not(miri))]
+    {
+        let bin = env!("CARGO_BIN_EXE_zero-check");
+        let root = std::env::temp_dir().join(format!("zero_check_k16_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("src")).expect("mkdir src");
+        std::fs::create_dir_all(root.join("tests")).expect("mkdir tests");
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"k16_probe\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .expect("write Cargo.toml");
+
+        let buggy_lib = concat!(
+            "#![forbid(unsafe_code)]\n",
+            "pub fn zero_free(buf: &mut [i64; 8]) { let _ = buf; }\n",
+            "pub fn cond_uaf(buf: &mut [i64; 8], cmd: u8) -> i64 {\n",
+            "    if cmd == 221 { zero_free(buf); }\n",
+            "    buf[0]\n",
+            "}\n",
+            "/// @uninit scratch\n",
+            "pub fn cond_uninit(scratch: &mut [i64; 16], mode: u8) -> i64 {\n",
+            "    scratch[0] = 7;\n",
+            "    if (mode & 1) == 1 { scratch[1] } else { scratch[0] }\n",
+            "}\n",
+            "/// @region a: 1, 0\n",
+            "/// @region b: 1, 8\n",
+            "pub fn region_collide(a: &mut [i64; 16], b: &[i64; 16], i: u8) -> i64 {\n",
+            "    let idx = (i & 15) as usize;\n",
+            "    a[idx] = b[idx];\n",
+            "    a[idx]\n",
+            "}\n",
+            "fn helper_div0(x: u16) -> i64 {\n",
+            "    if x == 4099 { 100 / (x as i64 - 4099) } else { match x { 0..=15 => 1, _ => 2 } }\n",
+            "}\n",
+            "pub fn entry_pkt(x: u16) -> i64 { helper_div0(x) }\n",
+        );
+        let miri_tests = concat!(
+            "use k16_probe::{cond_uaf, cond_uninit, entry_pkt, region_collide};\n",
+            "#[test]\n",
+            "fn partial_unit_tests_miss_all_four_bugs() {\n",
+            "    let mut b = [1_i64; 8];\n",
+            "    assert_eq!(cond_uaf(&mut b, 0), 1);\n",
+            "    assert_eq!(cond_uaf(&mut b, 1), 1);\n",
+            "    let mut s = [0_i64; 16];\n",
+            "    assert_eq!(cond_uninit(&mut s, 0), 7);\n",
+            "    let mut a = [0_i64; 16];\n",
+            "    let r = [3_i64; 16];\n",
+            "    assert_eq!(region_collide(&mut a, &r, 2), 3);\n",
+            "    assert_eq!(entry_pkt(7), 1);\n",
+            "}\n",
+        );
+        let lib_rs = root.join("src").join("lib.rs");
+        std::fs::write(&lib_rs, buggy_lib).expect("write buggy lib.rs");
+        std::fs::write(root.join("tests").join("miri_probe.rs"), miri_tests).expect("write miri test");
+
+        let miri_out = std::process::Command::new("cargo")
+            .env_remove("RUSTFLAGS")
+            .args(["+nightly", "miri", "test", "--manifest-path"])
+            .arg(root.join("Cargo.toml"))
+            .arg("--offline")
+            .output()
+            .expect("run cargo +nightly miri test");
+        assert!(
+            miri_out.status.success(),
+            "live Miri must pass partial tests: {}",
+            String::from_utf8_lossy(&miri_out.stderr)
+        );
+
+        let t0 = std::time::Instant::now();
+        let zc_bug = std::process::Command::new(bin)
+            .args(["--no-ledger", "--prove-fns", "--kernel-strict", "--require-totality"])
+            .arg(&lib_rs)
+            .output()
+            .expect("run zero-check on buggy crate");
+        let zc_ms = (t0.elapsed().as_micros() as f64) / 1000.0;
+        let bug_err = String::from_utf8_lossy(&zc_bug.stderr);
+        assert_ne!(miri_out.status.success(), zc_bug.status.success(), "knockout 16 Miri vs zero-check");
+        assert!(!zc_bug.status.success(), "zero-check must fail on buggy crate");
+        assert!(zc_ms < 10.0, "zero-check took {zc_ms:.3} ms (>= 10 ms)");
+        assert!(bug_err.contains("cond_uaf") && bug_err.contains("fault 0x10: [221]"), "missing UAF@221: {bug_err}");
+        assert!(bug_err.contains("cond_uninit") && bug_err.contains("fault 0x40:"), "missing Uninit: {bug_err}");
+        assert!(bug_err.contains("region_collide") && bug_err.contains("noalias overlap"), "missing NoAliasViolation: {bug_err}");
+        assert!(bug_err.contains("entry_pkt") && bug_err.contains("fault 0x08: [4099]"), "missing Div0@4099: {bug_err}");
+
+        let patched_lib = concat!(
+            "#![forbid(unsafe_code)]\n",
+            "pub fn zero_free(buf: &mut [i64; 8]) { let _ = buf; }\n",
+            "pub fn cond_uaf(buf: &mut [i64; 8], cmd: u8) -> i64 {\n",
+            "    if cmd == 221 { zero_free(buf); return 0; }\n",
+            "    buf[0]\n",
+            "}\n",
+            "/// @uninit scratch\n",
+            "pub fn cond_uninit(scratch: &mut [i64; 16], mode: u8) -> i64 {\n",
+            "    scratch[0] = 7;\n",
+            "    scratch[1] = 9;\n",
+            "    if (mode & 1) == 1 { scratch[1] } else { scratch[0] }\n",
+            "}\n",
+            "/// @region a: 1, 0\n",
+            "/// @region b: 1, 16\n",
+            "pub fn region_collide(a: &mut [i64; 16], b: &[i64; 16], i: u8) -> i64 {\n",
+            "    let idx = (i & 15) as usize;\n",
+            "    a[idx] = b[idx];\n",
+            "    a[idx]\n",
+            "}\n",
+            "fn helper_div0(x: u16) -> i64 {\n",
+            "    if x == 4099 { 0 } else { match x { 0..=15 => 1, _ => 2 } }\n",
+            "}\n",
+            "pub fn entry_pkt(x: u16) -> i64 { helper_div0(x) }\n",
+            "/// @domain idx: -10..=32\n",
+            "pub fn guarded_read(arr: &[i64; 16], idx: i64) -> i64 {\n",
+            "    if idx < 0 || (idx as usize) >= 16 { return 0; }\n",
+            "    arr[idx as usize]\n",
+            "}\n",
+        );
+        std::fs::write(&lib_rs, patched_lib).expect("write patched lib.rs");
+        let zc_ok = std::process::Command::new(bin)
+            .args(["--no-ledger", "--prove-fns", "--kernel-strict", "--require-totality"])
+            .arg(&lib_rs)
+            .output()
+            .expect("run zero-check on patched crate");
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(
+            zc_ok.status.success(),
+            "zero-check must prove patched crate: {}",
+            String::from_utf8_lossy(&zc_ok.stderr)
+        );
+    }
+
+    // (b) Direct overlapping vs disjoint sub-slice calls + comparison casts + conditional select.
+    let subslice_bad = concat!(
+        "fn blend(dst: &mut [i64; 16], src: &[i64; 16], i: u8) -> i64 {\n",
+        "    let idx = (i & 15) as usize;\n",
+        "    dst[idx] = src[idx];\n",
+        "    dst[idx]\n",
+        "}\n",
+        "pub fn call_overlap(buf: &mut [i64; 32], i: u8) -> i64 {\n",
+        "    blend(&mut buf[0..16], &buf[8..24], i)\n",
+        "}\n",
+    );
+    let subslice_ok = concat!(
+        "fn blend(dst: &mut [i64; 16], src: &[i64; 16], i: u8) -> i64 {\n",
+        "    let idx = (i & 15) as usize;\n",
+        "    dst[idx] = src[idx];\n",
+        "    dst[idx]\n",
+        "}\n",
+        "pub fn call_disjoint(buf: &mut [i64; 32], i: u8) -> i64 {\n",
+        "    blend(&mut buf[0..16], &buf[16..32], i)\n",
+        "}\n",
+        "/// @domain va: 0..=100, vb: 0..=100, vc: 0..=1, vt: 0..=50, vf: 0..=50\n",
+        "pub fn cmp_and_sel(va: i64, vb: i64, vc: i64, vt: i64, vf: i64) -> i64 {\n",
+        "    let gt = (va > vb) as i64;\n",
+        "    let chosen = if vc != 0_i64 { vt } else { vf };\n",
+        "    gt + chosen\n",
+        "}\n",
+    );
+    let r_bad = verify_rust_functions("sub_bad.rs", subslice_bad, ArchProfile::X86_64Avx2, RefineConfig::default());
+    let r_ok = verify_rust_functions("sub_ok.rs", subslice_ok, ArchProfile::X86_64Avx2, RefineConfig::default());
+    assert_ne!(r_ok.is_clean(), r_bad.is_clean(), "knockout 16b overlapping vs disjoint sub-slices");
+    assert!(matches!(r_bad.failed.first().map(|f| &f.error), Some(VerifyError::NoAliasViolation { .. })));
+    assert!(r_ok.is_clean() && r_ok.proven.len() >= 2);
 }
