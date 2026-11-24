@@ -1,23 +1,16 @@
 #![forbid(unsafe_code)]
-
 use std::{env, path::PathBuf, process::ExitCode, time::Instant};
 use zero_check::{promote_kernel_strict, run_gauntlet, scan_crate_dir_with_opts, verify_crate_functions_with_opts, verify_ntf1_file, ArchProfile, AutopoieticLedger, LintOptions, RefineConfig, RustFeOptions, Severity};
-
 struct CliArgs {
     targets: Vec<PathBuf>, ntf1_files: Vec<PathBuf>, skip: Vec<String>, ledger_path: Option<PathBuf>,
     emit_json: bool, quiet: bool, prove_fns: bool, kernel_strict: bool, require_totality: bool,
-    exclude_cfg_test: bool, audit_external: bool, emit_poc: bool, arch: ArchProfile,
+    exclude_cfg_test: bool, audit_external: bool, no_callgraph: bool, emit_poc: bool, arch: ArchProfile,
 }
-
-const USAGE: &str = "usage: zero-check [--ledger <path>] [--no-ledger] [--ntf1 <file>] [--skip <file>] [--exclude-cfg-test] [--audit-external] [--emit-poc] [--prove-fns] [--kernel-strict] [--require-totality] [--arch avx2|neon] [--emit-json] [--quiet] <target1> [target2 ...]";
-
+const USAGE: &str = "usage: zero-check [--ledger <path>] [--no-ledger] [--ntf1 <file>] [--skip <file>] [--exclude-cfg-test] [--audit-external] [--no-callgraph] [--emit-poc] [--prove-fns] [--kernel-strict] [--require-totality] [--arch avx2|neon] [--emit-json] [--quiet] <target1> [target2 ...]";
 fn parse_args() -> Result<CliArgs, String> {
-    let (mut targets, mut ntf1_files, mut skip) = (Vec::new(), Vec::new(), Vec::new());
-    let mut ledger_path = Some(env::temp_dir().join("zero_check_ledger.json"));
+    let (mut targets, mut ntf1_files, mut skip) = (Vec::new(), Vec::new(), Vec::new()); let mut ledger_path = Some(env::temp_dir().join("zero_check_ledger.json"));
     let (mut emit_json, mut quiet, mut prove_fns, mut kernel_strict, mut require_totality) = (false, false, false, false, false);
-    let (mut exclude_cfg_test, mut audit_external, mut emit_poc) = (false, false, false);
-    let mut arch = ArchProfile::X86_64Avx2;
-    let mut it = env::args().skip(1);
+    let (mut exclude_cfg_test, mut audit_external, mut no_callgraph, mut emit_poc) = (false, false, false, false); let mut arch = ArchProfile::X86_64Avx2; let mut it = env::args().skip(1);
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "--json" | "--ledger" => ledger_path = Some(PathBuf::from(it.next().ok_or_else(|| format!("{arg} requires a file path"))?)),
@@ -29,6 +22,7 @@ fn parse_args() -> Result<CliArgs, String> {
             },
             "--exclude-cfg-test" => exclude_cfg_test = true,
             "--audit-external" => { audit_external = true; exclude_cfg_test = true; prove_fns = true; kernel_strict = false; }
+            "--no-callgraph" => no_callgraph = true,
             "--emit-poc" => { emit_poc = true; prove_fns = true; }
             "--prove-fns" => prove_fns = true,
             "--kernel-strict" => { kernel_strict = true; audit_external = false; prove_fns = true; }
@@ -39,29 +33,24 @@ fn parse_args() -> Result<CliArgs, String> {
             "--help" | "-h" => return Err(USAGE.to_string()),
             other if other.starts_with('-') => return Err(format!("unknown flag: {other}")),
             path => {
-                let pb = PathBuf::from(path);
-                if pb.extension().and_then(|s| s.to_str()) == Some("ntf1") { ntf1_files.push(pb); } else { targets.push(pb); }
+                let pb = PathBuf::from(path); if pb.extension().and_then(|s| s.to_str()) == Some("ntf1") { ntf1_files.push(pb); } else { targets.push(pb); }
             }
         }
     }
     if targets.is_empty() && ntf1_files.is_empty() { return Err(USAGE.to_string()); }
-    Ok(CliArgs { targets, ntf1_files, skip, ledger_path, emit_json, quiet, prove_fns, kernel_strict, require_totality, exclude_cfg_test, audit_external, emit_poc, arch })
+    Ok(CliArgs { targets, ntf1_files, skip, ledger_path, emit_json, quiet, prove_fns, kernel_strict, require_totality, exclude_cfg_test, audit_external, no_callgraph, emit_poc, arch })
 }
-
 fn main() -> ExitCode {
-    let args = match parse_args() { Ok(a) => a, Err(msg) => { eprintln!("{msg}"); return ExitCode::from(2); } };
-    let t0 = Instant::now();
+    let args = match parse_args() { Ok(a) => a, Err(msg) => { eprintln!("{msg}"); return ExitCode::from(2); } }; let t0 = Instant::now();
     let mut ledger = args.ledger_path.as_ref().map_or_else(AutopoieticLedger::default, |p| AutopoieticLedger::load_or_new(p));
     let (mut crate_invariants, mut crate_rows, mut fn_rows, mut ntf1_rows) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     let (mut total_files, mut total_lines, mut total_errors, mut total_warnings) = (0, 0, 0, 0);
     let lint_opts = LintOptions { exclude_cfg_test: args.exclude_cfg_test || args.audit_external, audit_external: args.audit_external };
-    let fe_opts = RustFeOptions { skip_cfg_test: args.exclude_cfg_test || args.audit_external, enforce_reg_budget: !args.audit_external };
-
+    let fe_opts = RustFeOptions { skip_cfg_test: args.exclude_cfg_test || args.audit_external, enforce_reg_budget: !args.audit_external, interprocedural_reachability: args.audit_external && !args.no_callgraph };
     for dir in &args.targets {
         let mut rep = match scan_crate_dir_with_opts(dir, &args.skip, lint_opts) { Ok(r) => r, Err(e) => { eprintln!("[ZERO-CHECK-ERR] {}: {e}", dir.display()); return ExitCode::from(1); } };
         if args.kernel_strict && !args.audit_external { promote_kernel_strict(&mut rep); }
-        let (errs, warns) = (rep.error_count(), rep.warning_count());
-        total_files += rep.files_scanned; total_lines += rep.lines_scanned; total_errors += errs; total_warnings += warns;
+        let (errs, warns) = (rep.error_count(), rep.warning_count()); total_files += rep.files_scanned; total_lines += rep.lines_scanned; total_errors += errs; total_warnings += warns;
         if errs == 0 {
             let zero_unsafe = !rep.findings.iter().any(|f| f.severity == Severity::Error);
             crate_invariants.push(format!("crate:{} files={} loc={} errors=0 zero_unsafe={zero_unsafe}", dir.display(), rep.files_scanned, rep.lines_scanned));
@@ -70,14 +59,12 @@ fn main() -> ExitCode {
         if args.prove_fns {
             let reps = match verify_crate_functions_with_opts(dir, args.arch, RefineConfig::default(), &args.skip, fe_opts) { Ok(r) => r, Err(e) => { eprintln!("[ZERO-CHECK-ERR] {}: {e}", dir.display()); return ExitCode::from(1); } };
             for r in reps {
-                total_errors += r.failed.len();
-                if args.require_totality { total_errors += r.skipped_non_kernel_fns.len(); }
+                total_errors += r.failed.len(); if args.require_totality { total_errors += r.skipped_non_kernel_fns.len(); }
                 for (fn_name, _) in &r.proven { crate_invariants.push(format!("fn:{}::{} proven({})", r.file, fn_name, args.arch.name())); }
                 fn_rows.push(r);
             }
         }
     }
-
     for nf in &args.ntf1_files {
         match verify_ntf1_file(nf) {
             Ok(rep) => {
@@ -87,18 +74,12 @@ fn main() -> ExitCode {
             Err(e) => { total_errors += 1; eprintln!("[ZERO-CHECK-NTF1-ERR] {}: {e}", nf.display()); }
         }
     }
-
-    let gauntlet = run_gauntlet();
-    let mut all_invariants = crate_invariants;
-    all_invariants.extend(gauntlet.proven_invariants.clone());
-    ledger.crates_verified = args.targets.len(); ledger.files_scanned = total_files; ledger.lines_scanned = total_lines;
-    ledger.lint_errors = total_errors; ledger.lint_warnings = total_warnings;
-    ledger.gauntlet_passed = gauntlet.checks_passed; ledger.gauntlet_total = gauntlet.checks_total;
-    ledger.absorb_invariants(all_invariants, gauntlet.learned_guards.clone());
-    ledger.elapsed_us = t0.elapsed().as_micros() as u64;
+    let gauntlet = run_gauntlet(); let mut all_invariants = crate_invariants;
+    all_invariants.extend(gauntlet.proven_invariants.clone()); ledger.crates_verified = args.targets.len(); ledger.files_scanned = total_files; ledger.lines_scanned = total_lines;
+    ledger.lint_errors = total_errors; ledger.lint_warnings = total_warnings; ledger.gauntlet_passed = gauntlet.checks_passed; ledger.gauntlet_total = gauntlet.checks_total;
+    ledger.absorb_invariants(all_invariants, gauntlet.learned_guards.clone()); ledger.elapsed_us = t0.elapsed().as_micros() as u64;
     if let Some(ref lp) = args.ledger_path { if let Err(e) = ledger.save(lp) { eprintln!("[ZERO-CHECK-ERR] failed writing ledger: {e}"); return ExitCode::from(1); } }
     ledger.elapsed_us = t0.elapsed().as_micros() as u64;
-
     if args.emit_json { print!("{}", ledger.to_json()); }
     else if !args.quiet {
         for (path, files, lines, errs, warns, us, findings) in &crate_rows {
@@ -109,11 +90,16 @@ fn main() -> ExitCode {
             println!("[NTF1] {path}: +t={} -t={} 0t={} |>={} faults_covered={} idempotent={}", rep.forward_count, rep.retro_count, rep.airlock_count, rep.pipe_count, rep.faults_covered, rep.canonical_idempotent);
         }
         for r in &fn_rows {
-            if !r.proven.is_empty() || !r.failed.is_empty() || (args.require_totality && !r.skipped_non_kernel_fns.is_empty()) {
-                println!("[RUST-FE] {}: proven={} failed={} skipped={}", r.file, r.proven.len(), r.failed.len(), r.skipped_non_kernel_fns.len());
+            if !r.proven.is_empty() || !r.failed.is_empty() || !r.suppressed_guarded.is_empty() || (args.require_totality && !r.skipped_non_kernel_fns.is_empty()) {
+                if r.suppressed_guarded.is_empty() {
+                    println!("[RUST-FE] {}: proven={} failed={} skipped={}", r.file, r.proven.len(), r.failed.len(), r.skipped_non_kernel_fns.len());
+                } else {
+                    println!("[RUST-FE] {}: proven={} failed={} suppressed={} skipped={}", r.file, r.proven.len(), r.failed.len(), r.suppressed_guarded.len(), r.skipped_non_kernel_fns.len());
+                    for s in &r.suppressed_guarded { println!("  FN-SUPPRESSED {}::{}: {}", r.file, s.fn_name, s.reason); }
+                }
             }
             for f in &r.failed {
-                eprintln!("  FN-FAIL {}::{}: {}", r.file, f.fn_name, f.error);
+                eprintln!("  FN-FAIL {}::{}: {}", r.file, f.fn_name, f.error); if let Some(tr) = &f.entrypoint_trace { eprintln!("    ENTRY-TRACE: {}", tr.join(" -> ")); }
                 if args.emit_poc { if let Some(poc) = &f.poc_test { println!("{poc}"); } }
             }
             if args.require_totality && !r.skipped_non_kernel_fns.is_empty() { eprintln!("  FN-SKIP-FAIL {}: {:?}", r.file, r.skipped_non_kernel_fns); }
@@ -126,8 +112,6 @@ fn main() -> ExitCode {
             ledger.gauntlet_passed, ledger.gauntlet_total, ledger.proven_invariants.len(), ledger.learned_guards.len(),
             ledger.epochs, (ledger.elapsed_us as f64) / 1000.0, ledger.elapsed_us, lp_str
         );
-    } else if args.emit_poc {
-        for r in &fn_rows { for f in &r.failed { if let Some(poc) = &f.poc_test { println!("{poc}"); } } }
-    }
+    } else if args.emit_poc { for r in &fn_rows { for f in &r.failed { if let Some(poc) = &f.poc_test { println!("{poc}"); } } } }
     if total_errors == 0 && gauntlet.is_clean() { ExitCode::SUCCESS } else { ExitCode::from(1) }
 }

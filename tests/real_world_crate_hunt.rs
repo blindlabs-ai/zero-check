@@ -768,3 +768,126 @@ fn tokenize_multibyte_utf8_comments_no_panic_knockout() {
     assert_ne!(rep_ok.failed.len(), rep_bad.failed.len(), "knockout: bad() after UTF-8 comment must fail");
     assert_eq!(rep_bad.failed.len(), 1, "expected DivZero failure in bad(): {:?}", rep_bad.failed);
 }
+
+#[test]
+fn interprocedural_reachability_suppression_soundness_and_knockouts() {
+    let opts = RustFeOptions::external_audit();
+    let cfg = RefineConfig::default();
+    let arch = ArchProfile::X86_64Avx2;
+
+    // 1. All 4 Bun/robobun caller-guarded helper patterns cleanly suppressed.
+    let pat1 = r#"
+pub fn substring(self_: &[u8], start: Option<usize>, stop: Option<usize>) -> &[u8] {
+    let sta = start.unwrap_or(0);
+    let sto = stop.unwrap_or(self_.len());
+    &self_[sta.min(self_.len())..sto.min(self_.len())]
+}
+pub fn caller_sub<'a>(s: &'a [u8]) -> &'a [u8] { substring(s, Some(0), None) }
+"#;
+    let r1 = verify_rust_functions_with_opts("p1.rs", pat1, arch, cfg, opts);
+    assert_eq!(r1.failed.len(), 0, "pat1 stop=None should be suppressed: {:?}", r1.failed);
+    assert_eq!(r1.suppressed_guarded.len(), 1, "pat1 suppressed count: {:?}", r1.suppressed_guarded);
+
+    let pat2 = r#"
+pub fn push_digit(acc: u64, digit: u64, bits_per_digit: u32) -> u64 {
+    (acc << bits_per_digit) | digit
+}
+pub fn parse_int_radix(val: u64, d: u64, radix: i32) -> u64 {
+    if radix != 0 && !(2..=36).contains(&radix) { return 0; }
+    let radix = if radix == 0 { 10 } else { radix as u32 };
+    if radix.is_power_of_two() { return push_digit(val, d, radix.trailing_zeros()); }
+    0
+}
+"#;
+    let r2 = verify_rust_functions_with_opts("p2.rs", pat2, arch, cfg, opts);
+    assert_eq!(r2.failed.len(), 0, "pat2 pow2 trailing_zeros should be suppressed: {:?}", r2.failed);
+    assert_eq!(r2.suppressed_guarded.len(), 1, "pat2 suppressed count: {:?}", r2.suppressed_guarded);
+
+    let pat3_guarded = r#"
+pub fn u32_from_bytes(b: &[u8]) -> u32 {
+    ((b[0] as u32) << 24) | ((b[1] as u32) << 16) | ((b[2] as u32) << 8) | (b[3] as u32)
+}
+pub fn dispatch(buf: &[u8], payload: &[u8]) -> u32 {
+    if buf.len() != 4 { return 0; }
+    let a = u32_from_bytes(buf);
+    if payload.len() >= 4 { a ^ u32_from_bytes(&payload[0..4]) } else { a }
+}
+"#;
+    let r3_ok = verify_rust_functions_with_opts("p3_ok.rs", pat3_guarded, arch, cfg, opts);
+    assert_eq!(r3_ok.failed.len(), 0, "pat3 guarded u32_from_bytes should be suppressed: {:?}", r3_ok.failed);
+    assert_eq!(r3_ok.suppressed_guarded.len(), 1, "pat3 suppressed count: {:?}", r3_ok.suppressed_guarded);
+
+    // Counterfactual assert_ne! knockout: removing `if buf.len() != 4` flips failed 0 -> >=1 with ENTRY-TRACE.
+    let pat3_unguarded = r#"
+pub fn u32_from_bytes(b: &[u8]) -> u32 {
+    ((b[0] as u32) << 24) | ((b[1] as u32) << 16) | ((b[2] as u32) << 8) | (b[3] as u32)
+}
+pub fn dispatch(_tag: &str, buf: &[u8]) -> u32 { u32_from_bytes(buf) }
+"#;
+    let r3_bad = verify_rust_functions_with_opts("p3_bad.rs", pat3_unguarded, arch, cfg, opts);
+    assert_ne!(r3_ok.failed.len(), r3_bad.failed.len(), "knockout: removing guard must flip failure");
+    assert_eq!(r3_bad.failed.len(), 1);
+    assert_eq!(r3_bad.failed[0].entrypoint_trace, Some(vec!["dispatch".to_string(), "u32_from_bytes".to_string()]));
+
+    let pat4 = r#"
+pub fn first_err(errors: &[u32]) -> u32 { errors[0] }
+pub fn parse_wrap(errors: &[u32]) -> u32 {
+    if !errors.is_empty() { return first_err(errors); }
+    0
+}
+"#;
+    let r4 = verify_rust_functions_with_opts("p4.rs", pat4, arch, cfg, opts);
+    assert_eq!(r4.failed.len(), 0, "pat4 !is_empty() guard should be suppressed: {:?}", r4.failed);
+    assert_eq!(r4.suppressed_guarded.len(), 1, "pat4 suppressed count: {:?}", r4.suppressed_guarded);
+
+    // 2. Zero-caller pub fn soundness: NEVER suppressed when no caller exists.
+    let zero_caller = r#"
+pub fn u32_from_bytes(b: &[u8]) -> u32 {
+    ((b[0] as u32) << 24) | ((b[1] as u32) << 16) | ((b[2] as u32) << 8) | (b[3] as u32)
+}
+"#;
+    let r_zc = verify_rust_functions_with_opts("zc.rs", zero_caller, arch, cfg, opts);
+    assert_eq!(r_zc.failed.len(), 1, "zero-caller pub fn must NOT be suppressed");
+    assert_eq!(r_zc.failed[0].entrypoint_trace, Some(vec!["u32_from_bytes".to_string()]));
+
+    // 3. Multi-hop unguarded trace + PoC `// call-chain:` prefix.
+    let multi_hop = r#"
+pub fn read_u32_be(b: &[u8]) -> u32 {
+    ((b[0] as u32) << 24) | ((b[1] as u32) << 16) | ((b[2] as u32) << 8) | (b[3] as u32)
+}
+pub fn decode_header(_ctx: &str, pkt: &[u8]) -> u32 { read_u32_be(pkt) }
+pub fn parse_packet(ctx: &str, raw: &[u8]) -> u32 { decode_header(ctx, raw) }
+"#;
+    let r_mh = verify_rust_functions_with_opts("mh.rs", multi_hop, arch, cfg, opts);
+    assert_eq!(r_mh.failed.len(), 1);
+    assert_eq!(
+        r_mh.failed[0].entrypoint_trace,
+        Some(vec!["parse_packet".to_string(), "decode_header".to_string(), "read_u32_be".to_string()])
+    );
+    let poc = r_mh.failed[0].poc_test.as_deref().unwrap_or("");
+    assert!(poc.starts_with("// call-chain: parse_packet -> decode_header -> read_u32_be\n"), "missing call-chain prefix in PoC:\n{poc}");
+
+    // 4. Standalone published library soundness: pub fn NOT suppressed by internal wrapper; pub(crate) fn IS suppressed.
+    let tmp = std::env::temp_dir().join(format!("zc_standalone_lib_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(tmp.join("src")).expect("mkdir");
+    std::fs::write(tmp.join("Cargo.toml"), "[package]\nname = \"demo_pub_lib\"\nversion = \"0.1.0\"\nedition = \"2021\"\n").expect("write toml");
+    std::fs::write(
+        tmp.join("src/lib.rs"),
+        r#"
+pub fn pub_u32(b: &[u8]) -> u32 { ((b[0] as u32) << 24) | ((b[1] as u32) << 16) | ((b[2] as u32) << 8) | (b[3] as u32) }
+pub(crate) fn crate_u32(b: &[u8]) -> u32 { ((b[0] as u32) << 24) | ((b[1] as u32) << 16) | ((b[2] as u32) << 8) | (b[3] as u32) }
+pub fn internal_caller(buf: &[u8]) -> u32 {
+    if buf.len() != 4 { return 0; }
+    pub_u32(buf) ^ crate_u32(buf)
+}
+"#,
+    ).expect("write lib.rs");
+    let reps = zero_check::verify_crate_functions_with_opts(&tmp.join("src"), arch, cfg, &[], opts).expect("verify crate");
+    let _ = std::fs::remove_dir_all(&tmp);
+    assert_eq!(reps.len(), 1);
+    assert_eq!(reps[0].failed.len(), 1, "standalone lib pub fn must NOT be suppressed: {:?}", reps[0].failed);
+    assert_eq!(reps[0].failed[0].fn_name, "pub_u32");
+    assert_eq!(reps[0].suppressed_guarded.len(), 1, "standalone lib pub(crate) fn MUST be suppressed: {:?}", reps[0].suppressed_guarded);
+    assert_eq!(reps[0].suppressed_guarded[0].fn_name, "crate_u32");
+}
