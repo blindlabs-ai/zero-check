@@ -293,7 +293,7 @@ impl<Id: Copy> Op<Id> {
             Self::Div(a, b) => dom(a).eval_div_rem(dom(b), false).0, Self::Rem(a, b) => dom(a).eval_div_rem(dom(b), true).0,
             Self::Shl(a, s) => dom(a).eval_shl(s).0, Self::Shr(a, s) => dom(a).eval_shr(s).0,
             Self::ShlVar(a, b) => dom(b).is_const().filter(|&s| (0..64).contains(&s)).map_or(Domain::top(), |s| dom(a).eval_shl(s as u8).0),
-            Self::ShrVar(a, b) => dom(b).is_const().filter(|&s| (0..64).contains(&s)).map_or(Domain::top(), |s| dom(a).eval_shr(s as u8).0),
+            Self::ShrVar(a, b) => { let (da, db) = (dom(a), dom(b)); if db.lo >= 0 && db.hi < 64 { if da.is_nonneg() { Domain::range(da.lo >> db.hi, da.hi >> db.lo) } else { Domain::range(da.lo >> db.lo, da.hi >> db.lo) } } else { Domain::top() } }
             Self::BitAnd(a, b) => dom(a).eval_bit(dom(b), 0), Self::BitOr(a, b) => dom(a).eval_bit(dom(b), 1), Self::BitXor(a, b) => dom(a).eval_bit(dom(b), 2),
             Self::Cmp(k, a, b) => dom(a).eval_cmp(k, dom(b)),
             Self::Select { cond, t_val, f_val } => {
@@ -854,6 +854,16 @@ impl Program {
             };
             let Some(ov) = overlay else { continue; };
             doms[id] = mem.eval(&self.bufs, canon, certain, |k| env_dom(&ov.doms, &doms, &uf, k), pdoms);
+            if let Op::Select { cond, t_val, f_val } = canon {
+                if let Op::Cmp(k, a, b) = self.nodes[cond] {
+                    let (ra, rb, rt, rf, da, db) = (uf_find(&uf, a), uf_find(&uf, b), uf_find(&uf, t_val), uf_find(&uf, f_val), env_dom(&ov.doms, &doms, &uf, a), env_dom(&ov.doms, &doms, &uf, b));
+                    match (k, (rt, rf) == (ra, rb), (rt, rf) == (rb, ra)) {
+                        (CmpKind::Lt | CmpKind::Le, true, _) | (CmpKind::Gt | CmpKind::Ge, _, true) => doms[id] = doms[id].meet(Domain::range(da.lo.min(db.lo), da.hi.min(db.hi))),
+                        (CmpKind::Gt | CmpKind::Ge, true, _) | (CmpKind::Lt | CmpKind::Le, _, true) => doms[id] = doms[id].meet(Domain::range(da.lo.max(db.lo), da.hi.max(db.hi))),
+                        _ => {}
+                    }
+                }
+            }
             if g_raw.is_none() {
                 if canon.is_pure() && !matches!(canon, Op::PanicIfZero(_, _)) {
                     let prev = *memo.entry((None, canon)).or_insert(id);

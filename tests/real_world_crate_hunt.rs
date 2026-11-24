@@ -659,3 +659,80 @@ pub fn safe_after_unsafe(x: u32) -> u32 { if x > 0 { 100 / x } else { 0 } }
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn external_21_fp_regression_and_counterfactual_knockouts() {
+    // 1. Lexical ShiftOverflow (u128 fields/macros/arrays/parens) & modular u16/u32 casts must pass.
+    let lex_ok = r#"
+pub struct Rec { pub nan_mask: u128 }
+pub fn field_shift(rec: &Rec) -> u64 { (rec.nan_mask >> 64) as u64 }
+pub fn paren_shift(a: u128, b: u128) -> u128 { let mid = a + b; ((mid & 0x7FFF_FFFF_FFFF_FFFF) << 64) | (mid >> 63) }
+pub fn array_and_macro(x: u128) -> u64 {
+    macro_rules! hi { ($v:expr) => { ($v >> 64) as u64 }; }
+    let hp = [x; 4];
+    hi!(x) ^ ((hp[0] >> 64) as u64)
+}
+pub fn modular_bam() -> [u16; 2] { [-4096i16 as u16, -1i32 as u32 as u16] }
+"#;
+    let rep_lex_ok = scan_rust_source_with_opts("lex_ok.rs", lex_ok, LintOptions::external_audit());
+    assert_eq!(rep_lex_ok.error_count(), 0, "valid u128 shifts and modular u16/u32 casts must have 0 errors: {:?}", rep_lex_ok.findings);
+
+    // Counterfactual lexical knockouts: genuine u64 << 64, u128 << 128, u32 << 32, and -1 as usize must still fail.
+    for (name, src, kind) in [
+        ("bad_u64_var.rs", "pub fn f(x: u64) -> u64 { x << 64 }\n", LintKind::ShiftOverflow),
+        ("bad_u64_lit.rs", "pub fn f() -> u64 { 1u64 << 64 }\n", LintKind::ShiftOverflow),
+        ("bad_u128_128.rs", "pub fn f(x: u128) -> u128 { x << 128 }\n", LintKind::ShiftOverflow),
+        ("bad_u32_32.rs", "pub fn f(x: u32) -> u32 { x << 32 }\n", LintKind::ShiftOverflow),
+        ("bad_neg_usize.rs", "pub fn f() -> usize { -1 as usize }\n", LintKind::NegLitUsizeCast),
+    ] {
+        let rep = scan_rust_source_with_opts(name, src, LintOptions::external_audit());
+        assert_ne!(rep.error_count(), 0, "counterfactual {name} must fail closed");
+        assert!(rep.findings.iter().any(|f| f.kind == kind), "counterfactual {name} expected {kind:?}, got {:?}", rep.findings);
+    }
+
+    // 2. All 7 total Rust prover patterns must prove cleanly.
+    let prover_ok = r#"
+pub fn pack_decoded_lag10(d_exp: i32, sgn: usize) -> u32 {
+    1u32 | (((d_exp.max(-16).min(16) + 16) as u32) << 1) | ((sgn as u32) << 7)
+}
+pub fn shr_rne_u64(val: u64, shift: u32) -> u64 {
+    if shift == 0 { return val; }
+    if shift >= 64 { return u64::from(shift == 64 && val > (1u64 << 63)); }
+    let (rem, half, q) = (val & ((1u64 << shift) - 1), 1u64 << (shift - 1), val >> shift);
+    q + u64::from(rem > half || (rem == half && (q & 1) != 0))
+}
+pub fn mode4_tile_rows(nrows: usize, ncols: usize) -> usize {
+    if nrows == 0 { 0 }
+    else if ncols == 1 { nrows.min(4096).max(1) }
+    else if ncols < 8 { nrows.min(8192).max(1) }
+    else { nrows.div_ceil(nrows.div_ceil(65_536).max(1)) }
+}
+pub fn slice_at<'a>(buf: &'a [u8], off: usize, len: usize) -> Result<&'a [u8], &'static str> {
+    let end = off.checked_add(len).ok_or("overflow")?;
+    buf.get(off..end).ok_or("oob")
+}
+pub const fn zz_encode_i64(v: i64) -> u64 { ((v << 1) ^ (v >> 63)) as u64 }
+pub fn bias_i64(v: i64) -> u64 { (v as u64) ^ (1u64 << 63) }
+pub fn take_be_slice<'a>(b: &'a [u8], pos: &mut usize) -> Option<&'a [u8]> {
+    let n = u16::from_be_bytes([*b.get(*pos)?, *b.get(pos.checked_add(1)?)?]) as usize;
+    let start = pos.checked_add(2)?;
+    let end = start.checked_add(n)?;
+    let out = b.get(start..end)?;
+    *pos = end;
+    Some(out)
+}
+"#;
+    let rep_ok = verify_rust_functions_with_opts("prover_ok.rs", prover_ok, ArchProfile::X86_64Avx2, RefineConfig::default(), RustFeOptions::external_audit());
+    assert_eq!(rep_ok.failed.len(), 0, "all 7 total patterns must prove cleanly: {:?}", rep_ok.failed);
+    assert_eq!(rep_ok.proven.len(), 7, "expected all 7 functions proven: {:?}", rep_ok.proven);
+
+    // Counterfactual prover knockouts: unguarded add, div_ceil(0), shift >= 64 must still fail.
+    let prover_bad = r#"
+pub fn bad_add(a: usize, b: usize) -> usize { a + b }
+pub fn bad_div_ceil(a: usize, d: usize) -> usize { a.div_ceil(d) }
+pub fn bad_shift(x: u64, s: u32) -> u64 { x << s }
+"#;
+    let rep_bad = verify_rust_functions_with_opts("prover_bad.rs", prover_bad, ArchProfile::X86_64Avx2, RefineConfig::default(), RustFeOptions::external_audit());
+    assert_ne!(rep_ok.failed.len(), rep_bad.failed.len());
+    assert_eq!(rep_bad.failed.len(), 3, "all 3 unguarded counterfactuals must fail: {:?}", rep_bad.failed);
+}

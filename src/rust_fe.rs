@@ -553,6 +553,13 @@ impl<'a> LowerCtx<'a> {
                 if let Some(t) = ty.filter(|t| t.is_narrow()) { self.emit_range_check(res, t); } Some(Val::Scalar(res, ty))
             }
             "-" => {
+                if matches!(ty, Some(ScalarTy::U64 | ScalarTy::Usize)) && self.const_of(r) == Some(1) {
+                    match self.prog.nodes.get(l).copied() {
+                        Some(Op::Shl(a, s)) if self.const_of(a) == Some(1) && s < 64 => { let mx = self.prog.push(Op::Const(i64::MAX)); return Some(Val::Scalar(self.push_g(Op::Shr(mx, 63 - s)), ty)); }
+                        Some(Op::ShlVar(a, s)) if self.const_of(a) == Some(1) => { let (c63, mx) = (self.prog.push(Op::Const(63)), self.prog.push(Op::Const(i64::MAX))); let inv = self.push_g(Op::Sub(c63, s)); return Some(Val::Scalar(self.push_g(Op::ShrVar(mx, inv)), ty)); }
+                        _ => {}
+                    }
+                }
                 if ty.is_some_and(ScalarTy::is_unsigned) { let ge = self.push_g(Op::Cmp(CmpKind::Ge, l, r)); self.push_g(Op::PanicIfZero(ge, 4)); }
                 let res = self.push_g(Op::Sub(l, r));
                 if let Some(t) = ty.filter(|t| t.is_narrow() && !t.is_unsigned()) { self.emit_range_check(res, t); } Some(Val::Scalar(res, ty))
@@ -600,7 +607,8 @@ impl<'a> LowerCtx<'a> {
             let ((v, src_ty), dst) = (scalar_id(&val)?, self.file.resolve_scalar(&c.expect_ident()?)?);
             let nv = match dst {
                 ScalarTy::U8 | ScalarTy::U16 | ScalarTy::U32 => { let m = self.prog.push(Op::Const(dst.bounds().1)); self.push_g(Op::BitAnd(v, m)) }
-                ScalarTy::U64 | ScalarTy::Usize => if src_ty.is_some_and(|t| t.is_unsigned() || t == ScalarTy::Bool) { v } else { self.push_g(Op::BoundsCheck { idx: v, limit: (i64::MAX as usize).saturating_add(1) }) },
+                ScalarTy::U64 => v,
+                ScalarTy::Usize => if src_ty.is_some_and(|t| t.is_unsigned() || t == ScalarTy::Bool) { v } else { self.push_g(Op::BoundsCheck { idx: v, limit: (i64::MAX as usize).saturating_add(1) }) },
                 ScalarTy::I8 | ScalarTy::I16 | ScalarTy::I32 => if src_ty.is_some_and(|st| st.fits_in(dst)) { v } else { let s = (64 - dst.bits()) as u8; let sh = self.push_g(Op::Shl(v, s)); self.push_g(Op::Shr(sh, s)) },
                 ScalarTy::I64 | ScalarTy::Isize | ScalarTy::Bool => v,
             };
@@ -648,7 +656,7 @@ impl<'a> LowerCtx<'a> {
         let reg = self.alloc_region();
         let all_same = elems.first().and_then(|&id| self.const_of(id)).filter(|&cv| elems.iter().all(|&id| self.const_of(id) == Some(cv)));
         let bid = if let Some(cv) = all_same { self.prog.add_buf(format!("__arr_{reg}"), elems.len(), true, reg, 0, Domain::exact(cv)) } else {
-            let id = self.prog.add_uninit_buf(format!("__arr_{reg}"), elems.len(), true, reg, 0, ety.domain());
+            let id = self.prog.add_buf(format!("__arr_{reg}"), elems.len(), true, reg, 0, ety.domain());
             for (k, &val) in elems.iter().enumerate() { let ki = self.prog.push(Op::Const(k as i64)); let st = self.push_g(Op::Store { buf: id, idx: ki, val }); self.stores.push(st); } id
         };
         Some(Val::Buf(BufBind { id: bid, base_const: 0, base_node: None, len_const: elems.len(), len_node: None, root_len: None, mutable: true, elem_ty: ety }))
@@ -757,7 +765,7 @@ impl<'a> LowerCtx<'a> {
                 if is_add {
                     let mx = self.prog.push(Op::Const(i64::MAX)); let room = self.push_g(Op::Sub(mx, base));
                     let ok = self.push_g(Op::Cmp(CmpKind::Le, r, room)); self.cur_guard = self.and_guard(old_g, (ok, true));
-                    let s = self.push_g(Op::Add(base, r)); self.cur_guard = old_g; Some(Val::Scalar(self.push_g(Op::Select { cond: ok, t_val: s, f_val: mx }), Some(eff)))
+                    let raw = self.push_g(Op::WrapAdd(base, r)); let s = self.push_g(Op::BitAnd(raw, mx)); self.cur_guard = old_g; Some(Val::Scalar(self.push_g(Op::Select { cond: ok, t_val: s, f_val: mx }), Some(eff)))
                 } else {
                     let ge = self.push_g(Op::Cmp(CmpKind::Ge, base, r)); self.cur_guard = self.and_guard(old_g, (ge, true));
                     let d = self.push_g(Op::Sub(base, r)); self.cur_guard = old_g; let z = self.prog.push(Op::Const(0));
@@ -768,7 +776,7 @@ impl<'a> LowerCtx<'a> {
                 let (r, rt) = scalar_id(args.first()?)?; let eff = ty.or(rt)?; let ((lo, hi), old_g) = (eff.bounds(), self.cur_guard);
                 let (ok, val) = match m {
                     "checked_add" if eff.is_narrow() => { let s = self.push_g(Op::Add(base, r)); (self.in_bounds(s, lo, hi, true), s) }
-                    "checked_add" if eff.is_unsigned() => { let mx = self.prog.push(Op::Const(i64::MAX)); let room = self.push_g(Op::Sub(mx, base)); let ok = self.push_g(Op::Cmp(CmpKind::Le, r, room)); self.cur_guard = self.and_guard(old_g, (ok, true)); let s = self.push_g(Op::Add(base, r)); self.cur_guard = old_g; (ok, s) }
+                    "checked_add" if eff.is_unsigned() => { let mx = self.prog.push(Op::Const(i64::MAX)); let room = self.push_g(Op::Sub(mx, base)); let ok = self.push_g(Op::Cmp(CmpKind::Le, r, room)); self.cur_guard = self.and_guard(old_g, (ok, true)); let raw = self.push_g(Op::WrapAdd(base, r)); let s = self.push_g(Op::BitAnd(raw, mx)); self.cur_guard = old_g; (ok, s) }
                     "checked_sub" if eff.is_unsigned() => { let ok = self.push_g(Op::Cmp(CmpKind::Ge, base, r)); self.cur_guard = self.and_guard(old_g, (ok, true)); let d = self.push_g(Op::Sub(base, r)); self.cur_guard = old_g; (ok, d) }
                     "checked_sub" if eff.is_narrow() => { let d = self.push_g(Op::Sub(base, r)); (self.in_bounds(d, lo, hi, true), d) }
                     "checked_mul" if matches!(eff, ScalarTy::U8 | ScalarTy::U16 | ScalarTy::I8 | ScalarTy::I16 | ScalarTy::I32) => { let p = self.push_g(Op::Mul(base, r)); (self.in_bounds(p, lo, hi, true), p) }
@@ -793,9 +801,10 @@ impl<'a> LowerCtx<'a> {
                 Some(Val::Scalar(self.push_g(Op::Select { cond: nz, t_val: eq0, f_val: base0 }), Some(ScalarTy::Bool)))
             }
             "div_ceil" if ty.is_some_and(ScalarTy::is_unsigned) => {
-                let ((r, _), z, one) = (scalar_id(args.first()?)?, self.prog.push(Op::Const(0)), self.prog.push(Op::Const(1)));
+                let ((r, _), z, one, mx, old_g) = (scalar_id(args.first()?)?, self.prog.push(Op::Const(0)), self.prog.push(Op::Const(1)), self.prog.push(Op::Const(i64::MAX)), self.cur_guard);
                 let (q, rem) = (self.push_g(Op::Div(base, r)), self.push_g(Op::Rem(base, r)));
-                let (has_rem, qp1) = (self.push_g(Op::Cmp(CmpKind::Ne, rem, z)), self.push_g(Op::Add(q, one)));
+                let has_rem = self.push_g(Op::Cmp(CmpKind::Ne, rem, z)); self.cur_guard = self.and_guard(old_g, (has_rem, true));
+                let raw_qp1 = self.push_g(Op::WrapAdd(q, one)); let qp1 = self.push_g(Op::BitAnd(raw_qp1, mx)); self.cur_guard = old_g;
                 let res = self.push_g(Op::Select { cond: has_rem, t_val: qp1, f_val: q });
                 if let Some(t) = ty.filter(|t| t.is_narrow()) { self.emit_range_check(res, t); } Some(Val::Scalar(res, ty))
             }
