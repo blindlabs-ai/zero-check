@@ -9,6 +9,7 @@ pub const FAULT_DIV0: u8 = 1 << 3;
 pub const FAULT_UAF: u8 = 1 << 4;
 pub const FAULT_DOUBLE_FREE: u8 = 1 << 5;
 pub const FAULT_UNINIT: u8 = 1 << 6;
+pub const FAULT_PANIC: u8 = 1 << 7;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RefineConfig { pub max_epochs: usize, pub fuzz_ticks_per_box: usize, pub seed: u64, pub synthesize_safe_boundary: bool }
@@ -34,7 +35,7 @@ pub struct RefineReport {
 }
 
 #[must_use] pub fn fault_name(fault: u8) -> &'static str {
-    for (bit, name) in [(FAULT_UAF, "UAF"), (FAULT_DOUBLE_FREE, "DOUBLE_FREE"), (FAULT_UNINIT, "UNINIT"), (FAULT_OOB, "OOB"), (FAULT_DIV0, "DIV0"), (FAULT_SHIFT, "SHIFT"), (FAULT_OVERFLOW, "OVERFLOW")] {
+    for (bit, name) in [(FAULT_PANIC, "PANIC"), (FAULT_UAF, "UAF"), (FAULT_DOUBLE_FREE, "DOUBLE_FREE"), (FAULT_UNINIT, "UNINIT"), (FAULT_OOB, "OOB"), (FAULT_DIV0, "DIV0"), (FAULT_SHIFT, "SHIFT"), (FAULT_OVERFLOW, "OVERFLOW")] {
         if (fault & bit) != 0 { return name; }
     }
     "NONE"
@@ -129,6 +130,8 @@ impl LaneCtx {
             Op::Cmp(k, a, b) => std::array::from_fn(|l| i64::from(k.eval(vals[a][l], vals[b][l]))),
             Op::Select { cond, t_val, f_val } => std::array::from_fn(|l| if vals[cond][l] != 0 { vals[t_val][l] } else { vals[f_val][l] }),
             Op::BoundsCheck { idx, limit } => { for (l, &iv) in vals[idx].iter().enumerate() { ctx.mark(l, id, act[l] && (iv < 0 || (iv as usize) >= limit), FAULT_OOB); } vals[idx] }
+            Op::DynBoundsCheck(idx, len) => { for l in 0..LANES { let (iv, lv) = (vals[idx][l], vals[len][l]); ctx.mark(l, id, act[l] && (iv < 0 || lv <= 0 || iv >= lv), FAULT_OOB); } vals[idx] }
+            Op::PanicIfZero(cond, _) => { for l in 0..LANES { ctx.mark(l, id, act[l] && vals[cond][l] == 0, FAULT_PANIC); } vals[cond] }
             Op::Load { buf, idx } => ctx.load(id, act, prog.bufs[usize::from(buf)].elem_domain, &shadow[usize::from(buf)], &writes[usize::from(buf)], vals[idx]),
             Op::Store { buf, idx, val } => ctx.store(id, act, &mut shadow[usize::from(buf)], &mut writes[usize::from(buf)], vals[idx], vals[val]),
         };
@@ -138,10 +141,13 @@ impl LaneCtx {
 
 /// Generate 8 parallel boundary/Zipfian/adversarial inputs per parameter inside `doms`.
 #[must_use] pub fn sample_batch_x8(doms: &[Domain], tick: usize, seed: &mut u64) -> Vec<[i64; LANES]> {
-    doms.iter().map(|&d| {
+    let multi = doms.len() > 1;
+    doms.iter().enumerate().map(|(pi, &d)| {
         let (width, mid) = (d.width_u128(), d.lo.wrapping_add((d.width_u128() / 2) as i64));
         if tick == 0 {
-            let corners = [d.lo, d.hi, d.lo.saturating_add(1), d.hi.saturating_sub(1), 0, -1, 1, mid];
+            let corners = if !multi { [d.lo, d.hi, d.lo.saturating_add(1), d.hi.saturating_sub(1), 0, -1, 1, mid] }
+                else if (pi & 1) == 0 { [d.lo, d.hi, 0, -1, d.hi, d.lo, d.lo.saturating_add(1), mid] }
+                else { [d.lo, d.hi, d.lo.saturating_add(1), d.hi.saturating_sub(1), d.lo, d.hi, d.lo, mid.saturating_sub(1)] };
             return std::array::from_fn(|l| snap_domain(d, corners[l]));
         }
         std::array::from_fn(|l| {
@@ -172,23 +178,56 @@ fn fmt_box(box_doms: &[Domain]) -> String {
 fn err_root_node(prog: &Program, err: &VerifyError) -> Option<usize> {
     match *err {
         VerifyError::OutOfBounds { node, .. } | VerifyError::UninitializedRead { node, .. } | VerifyError::ShiftOverflow { node, .. }
-        | VerifyError::IntOverflow { node } | VerifyError::UseAfterFree { node, .. } | VerifyError::DoubleFree { node, .. } => Some(node),
+        | VerifyError::IntOverflow { node } | VerifyError::ExplicitPanic { node } | VerifyError::UseAfterFree { node, .. } | VerifyError::DoubleFree { node, .. } => Some(node),
         VerifyError::DivByZero { node } => Some(match prog.nodes[node] { Op::Div(_, b) | Op::Rem(_, b) => b, _ => node }),
         _ => None,
     }
 }
 
-fn unwrap_param(prog: &Program, mut id: usize) -> Option<usize> {
-    for _ in 0..8 { match prog.nodes[id] { Op::Param(p) => return Some(usize::from(p)), Op::BoundsCheck { idx, .. } => id = idx, _ => return None } }
+fn unwrap_param_off(prog: &Program, mut id: usize) -> Option<(usize, i128)> {
+    let mut off = 0i128;
+    for _ in 0..8 {
+        match prog.nodes[id] {
+            Op::Param(p) => return Some((usize::from(p), off)),
+            Op::BoundsCheck { idx, .. } | Op::DynBoundsCheck(idx, _) => id = idx,
+            Op::Add(a, b) | Op::WrapAdd(a, b) => match (prog.nodes[a], prog.nodes[b]) {
+                (_, Op::Const(k)) => { off += i128::from(k); id = a; }
+                (Op::Const(k), _) => { off += i128::from(k); id = b; }
+                _ => return None,
+            },
+            Op::Sub(a, b) | Op::WrapSub(a, b) => if let Op::Const(k) = prog.nodes[b] { off -= i128::from(k); id = a; } else { return None; },
+            _ => return None,
+        }
+    }
     None
+}
+
+fn pick_cut(d: Domain, cut: i128) -> Option<i64> {
+    let (lo, hi) = (i128::from(d.lo), i128::from(d.hi));
+    if cut > lo && cut <= hi { Some(cut as i64) } else if cut == lo && cut < hi { Some((cut + 1) as i64) } else { None }
 }
 
 fn cmp_split_target(prog: &Program, box_doms: &[Domain], err: &VerifyError) -> Option<(usize, i64)> {
     let check_cmp = |op: Op<usize>| -> Option<(usize, i64)> {
-        let Op::Cmp(_, a, b) = op else { return None; };
-        let (p, k) = match (unwrap_param(prog, a), prog.nodes[b], unwrap_param(prog, b), prog.nodes[a]) { (Some(p), Op::Const(k), _, _) | (_, _, Some(p), Op::Const(k)) => (p, k), _ => return None };
-        let d = *box_doms.get(p)?;
-        if k > d.lo && k <= d.hi { Some((p, k)) } else if k == d.lo && k < d.hi { Some((p, k + 1)) } else { None }
+        let (a, b, is_dyn) = match op { Op::Cmp(_, a, b) => (a, b, false), Op::DynBoundsCheck(a, b) => (a, b, true), _ => return None };
+        let (pa, pb) = (unwrap_param_off(prog, a), unwrap_param_off(prog, b));
+        match (pa, prog.nodes[b], pb, prog.nodes[a]) {
+            (Some((p, off)), Op::Const(k), _, _) | (_, _, Some((p, off)), Op::Const(k)) => {
+                pick_cut(*box_doms.get(p)?, i128::from(k) - off).map(|c| (p, c))
+            }
+            (Some((ia, oa)), _, Some((ib, ob)), _) if ia != ib => {
+                let (da, db) = (*box_doms.get(ia)?, *box_doms.get(ib)?);
+                if is_dyn && db.lo == 0 && db.hi > 0 { return Some((ib, 1)); }
+                for (dim, d, cut) in [
+                    (ib, db, i128::from(da.lo) + oa - ob), (ia, da, i128::from(db.lo) + ob - oa),
+                    (ib, db, i128::from(da.hi) + oa - ob), (ia, da, i128::from(db.hi) + ob - oa),
+                ] {
+                    if let Some(c) = pick_cut(d, cut) { return Some((dim, c)); }
+                }
+                None
+            }
+            _ => None,
+        }
     };
     if let Some(root) = err_root_node(prog, err) {
         let (mut stack, mut hops) = (vec![root], 0usize);
@@ -212,7 +251,7 @@ fn mod_split_target(prog: &Program, err: &VerifyError) -> Option<i64> {
         match prog.nodes[u] {
             Op::Rem(_, d_id) => if let Op::Const(d) = prog.nodes[d_id] { if d > 1 && d <= 64 && d % 2 == 0 { return Some(d); } },
             Op::BitAnd(_, m_id) => if let Op::Const(m) = prog.nodes[m_id] { if m > 0 && m < 64 && ((m + 1) & m) == 0 { return Some(m + 1); } },
-            Op::Load { idx, .. } | Op::Store { idx, .. } | Op::BoundsCheck { idx, .. } => stack.push(idx),
+            Op::Load { idx, .. } | Op::Store { idx, .. } | Op::BoundsCheck { idx, .. } | Op::DynBoundsCheck(idx, _) => stack.push(idx),
             op => { let (kids, cnt) = op.children(); stack.extend_from_slice(&kids[..cnt]); }
         }
     }
@@ -360,3 +399,69 @@ fn probe_box(prog: &Program, cur: &[Domain], rounds: usize, seed: &mut u64, tick
 
 /// Kani-class exact exhaustive branch-and-bound proof over the entire input domain with safe-guard synthesis.
 #[must_use] pub fn prove_exhaustive(prog: &Program, cfg: RefineConfig) -> ProofVerdict { refine_and_fuzz(prog, RefineConfig { synthesize_safe_boundary: true, ..cfg }).verdict }
+
+/// Concrete 2-tick SIMD witness sampler for static `DefiniteBug` PoC extraction.
+#[must_use] pub fn sample_counterexample(prog: &Program, mut seed: u64) -> Option<Counterexample> {
+    if prog.validate().is_err() { return None; }
+    let doms: Vec<Domain> = prog.param_domains.iter().map(|&d| d.tighten().unwrap_or(d)).collect();
+    let (mut ticks, mut evals, mut ces) = (0, 0, Vec::new());
+    probe_box(prog, &doms, 2, &mut seed, &mut ticks, &mut evals, &mut ces);
+    ces.into_iter().next()
+}
+
+fn parse_slice_spec(raw: &str) -> Option<(bool, &str, &str)> {
+    let (is_mut, rest) = if let Some(r) = raw.strip_prefix("mut_slice_len:") { (true, r) }
+        else if let Some(r) = raw.strip_prefix("slice_len:") { (false, r) }
+        else { return None; };
+    let (name, ty) = rest.split_once(':').map_or((rest, "u8"), |(n, t)| (n, if t.is_empty() { "u8" } else { t }));
+    (!name.is_empty()).then_some((is_mut, name, ty))
+}
+
+/// Emit a standalone Rust `#[test]` reproducing `ce`, reconstructing named `&[T]`/`&mut [T]` slices and `Option<T>` pairs.
+#[must_use] pub fn synthesize_rust_poc_test_named(fn_name: &str, param_names: &[String], ce: &Counterexample) -> String {
+    let mut clean = String::new();
+    for c in fn_name.chars() {
+        if c.is_ascii_alphanumeric() || c == '_' { clean.push(c); } else if !clean.ends_with('_') { clean.push('_'); }
+    }
+    let test_id = clean.trim_matches('_');
+    let test_id = if test_id.is_empty() { "witness" } else { test_id };
+    let mut out = format!("#[test]\nfn poc_{test_id}() {{\n    // zero-check witness: node {} fault {} inputs={:?}\n", ce.node, fault_name(ce.fault), ce.inputs);
+    let (mut args, mut i) = (Vec::with_capacity(ce.inputs.len()), 0usize);
+    while i < ce.inputs.len() {
+        let val = ce.inputs[i];
+        let pname = param_names.get(i).map(String::as_str).unwrap_or("");
+        if let Some(base) = pname.strip_suffix("_is_some") {
+            let next_name = param_names.get(i + 1).map(String::as_str).unwrap_or("");
+            if !base.is_empty() && next_name.strip_suffix("_val") == Some(base) && i + 1 < ce.inputs.len() {
+                if val == 0 { out.push_str(&format!("    let {base} = None;\n")); }
+                else { out.push_str(&format!("    let {base} = Some({});\n", ce.inputs[i + 1])); }
+                args.push(base.to_string());
+                i += 2;
+                continue;
+            }
+        }
+        if let Some((is_mut, name, ty)) = parse_slice_spec(pname) {
+            let len = usize::try_from(val).map_or(0, |n| n.min(65_536));
+            let kw = if is_mut { "let mut" } else { "let" };
+            out.push_str(&format!("    {kw} {name}: Vec<{ty}> = vec![Default::default(); {len}];\n"));
+            args.push(if is_mut { format!("&mut {name}") } else { format!("&{name}") });
+        } else {
+            let var = if pname.is_empty() { format!("p{i}") } else { pname.to_string() };
+            out.push_str(&format!("    let {var} = {val};\n"));
+            args.push(var);
+        }
+        i += 1;
+    }
+    out.push_str(&format!("    let _ = {fn_name}({});\n}}\n", args.join(", ")));
+    out
+}
+
+/// Emit a standalone Rust `#[test]` reproducing `ce` with positional `p0..pN` bindings.
+#[must_use] pub fn synthesize_rust_poc_test(fn_name: &str, ce: &Counterexample) -> String {
+    synthesize_rust_poc_test_named(fn_name, &[], ce)
+}
+
+/// Emit a standalone Rust `#[test]` reproducing `ce` using `prog.name` and `prog.param_names`.
+#[must_use] pub fn synthesize_rust_poc_test_for_prog(prog: &Program, ce: &Counterexample) -> String {
+    synthesize_rust_poc_test_named(&prog.name, &prog.param_names, ce)
+}

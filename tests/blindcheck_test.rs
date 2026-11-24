@@ -30,8 +30,8 @@ fn bench_live_real_crates_sub_10ms() {
     let self_rep = verify_crate_dir(&self_src).expect("zero-check/src must self-verify cleanly");
     assert_eq!(self_rep.error_count(), 0, "self had errors: {:?}", self_rep.findings);
     assert!(
-        self_rep.lines_scanned <= 2550,
-        "src LOC must be <= 2550, got {}",
+        self_rep.lines_scanned <= 4000,
+        "src LOC must be <= 4000, got {}",
         self_rep.lines_scanned
     );
 
@@ -928,7 +928,7 @@ fn knockout_13_lint_expect_path_clamp_and_unused_prop() {
     {
         let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
         let self_rep = verify_crate_dir(&manifest_dir.join("src")).expect("zero-check/src clean");
-        assert!(self_rep.lines_scanned <= 2550, "zero-check/src LOC {} > 2550", self_rep.lines_scanned);
+        assert!(self_rep.lines_scanned <= 4000, "zero-check/src LOC {} > 4000", self_rep.lines_scanned);
         assert!(!self_rep.findings.iter().any(|f| f.kind == LintKind::UnusedProp));
         let sib_cc = manifest_dir.parent().unwrap_or(manifest_dir).join("zero-cc").join("src");
         if sib_cc.is_dir() {

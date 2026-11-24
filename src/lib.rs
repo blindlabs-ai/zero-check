@@ -76,10 +76,10 @@ pub mod abstract_eval; pub mod gauntlet; pub mod lint_rs; pub mod ntf1; pub mod 
 use std::path::Path;
 pub use abstract_eval::{AbstractReport, AllocState, ArchProfile, BufSpec, CmpKind, Domain, IrOp, NodeId, Op, Program, ProofStatus, RegBudget, ScheduleReport, VerifyError};
 pub use gauntlet::{build_quad_mod16_kernel, run_gauntlet, AutopoieticLedger, GauntletSummary};
-pub use lint_rs::{promote_kernel_strict, scan_crate_dir, scan_crate_dir_skip, scan_rust_source, LintFinding, LintKind, LintReport, Severity};
+pub use lint_rs::{promote_kernel_strict, scan_crate_dir, scan_crate_dir_skip, scan_crate_dir_with_opts, scan_rust_source, scan_rust_source_with_opts, LintFinding, LintKind, LintOptions, LintReport, Severity};
 pub use ntf1::{check_svo_tax, emit_ntf1, parse_ntf1, verify_ntf1_file, verify_ntf1_source, Ntf1Doc, Ntf1Error, Ntf1Kind, Ntf1Report, Ntf1Stmt};
-pub use rust_fe::{parse_rust_programs, verify_crate_functions, verify_crate_functions_skip, verify_rust_functions, ParsedRustUnit, RustFnFailure, RustProofReport};
-pub use simd_fuzz::{eval_lanes_x8, fault_name, format_box_invariant, prove_exhaustive, refine_and_fuzz, sample_batch_x8, BatchEval, Counterexample, ProofVerdict, RefineConfig, RefineReport, FAULT_DIV0, FAULT_DOUBLE_FREE, FAULT_NONE, FAULT_OOB, FAULT_OVERFLOW, FAULT_SHIFT, FAULT_UAF, FAULT_UNINIT, LANES};
+pub use rust_fe::{parse_rust_programs, parse_rust_programs_with_opts, verify_crate_functions, verify_crate_functions_skip, verify_crate_functions_with_opts, verify_rust_functions, verify_rust_functions_with_opts, ParsedRustUnit, RustFeOptions, RustFnFailure, RustProofReport, MAX_SYM_SLICE_LEN};
+pub use simd_fuzz::{eval_lanes_x8, fault_name, format_box_invariant, prove_exhaustive, refine_and_fuzz, sample_batch_x8, sample_counterexample, synthesize_rust_poc_test, synthesize_rust_poc_test_for_prog, synthesize_rust_poc_test_named, BatchEval, Counterexample, ProofVerdict, RefineConfig, RefineReport, FAULT_DIV0, FAULT_DOUBLE_FREE, FAULT_NONE, FAULT_OOB, FAULT_OVERFLOW, FAULT_PANIC, FAULT_SHIFT, FAULT_UAF, FAULT_UNINIT, LANES};
 
 #[derive(Clone, Debug)]
 pub struct ProgramReport { pub abstract_report: AbstractReport, pub refine_report: Option<RefineReport>, pub verdict: ProofVerdict }

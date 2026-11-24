@@ -61,6 +61,7 @@ crate::define_errors!(pub VerifyError {
     IntOverflow { node: NodeId } => ("node {node}: signed i64 overflow"),
     ShiftOverflow { node: NodeId, lo: i64, hi: i64 } => ("node {node}: shift [{lo},{hi}] outside 0..64"),
     DivByZero { node: NodeId } => ("node {node}: div/rem by zero or i64::MIN / -1"),
+    ExplicitPanic { node: NodeId } => ("node {node}: reachable panic/assert/unwrap"),
     RegisterSpill { profile: ArchProfile, peak_gprs: usize, max_gprs: usize, peak_vecs: usize, max_vecs: usize } => ("register spill on {}: gprs {peak_gprs}/{max_gprs}, vecs {peak_vecs}/{max_vecs}", profile.name()),
     CounterexampleFound { node: NodeId, fault: u8, inputs: Vec<i64> } => ("counterexample node {node} fault 0x{fault:02x}: {inputs:?}"),
     LintViolations { count: usize } => ("static Rust linter found {count} error(s)"),
@@ -75,6 +76,16 @@ fn gcd_i128(mut a: i128, mut b: i128) -> i128 {
     a = a.saturating_abs(); b = b.saturating_abs();
     while b != 0 { let t = a % b; a = b; b = t; }
     if a == 0 { 1 } else { a }
+}
+fn ext_gcd_i128(a: i128, b: i128) -> (i128, i128, i128) {
+    let (mut old_r, mut r, mut old_s, mut s, mut old_t, mut t) = (a, b, 1i128, 0i128, 0i128, 1i128);
+    while r != 0 {
+        let q = old_r / r;
+        (old_r, r) = (r, old_r - q * r);
+        (old_s, s) = (s, old_s - q * s);
+        (old_t, t) = (t, old_t - q * t);
+    }
+    if old_r < 0 { (-old_r, -old_s, -old_t) } else { (old_r, old_s, old_t) }
 }
 fn gcd_i64(a: i64, b: i64) -> i64 { let g = gcd_i128(i128::from(a), i128::from(b)); if g > i128::from(i64::MAX) { 1 } else { g as i64 } }
 
@@ -121,9 +132,27 @@ impl Domain {
     }
     #[must_use] pub fn try_meet(self, other: Self) -> Option<Self> {
         let (lo, hi) = (self.lo.max(other.lo), self.hi.min(other.hi));
-        if lo > hi || (self.modulus > 1 && other.modulus > 1 && self.modulus == other.modulus && self.rem != other.rem) { return None; }
-        let (modulus, rem) = if other.modulus > self.modulus { (other.modulus, other.rem) } else { (self.modulus, self.rem) };
-        Self { lo, hi, modulus, rem }.tighten()
+        if lo > hi || self.modulus < 1 || other.modulus < 1 { return None; }
+        if self.modulus == 1 { return Self { lo, hi, modulus: other.modulus, rem: other.rem }.tighten(); }
+        if other.modulus == 1 { return Self { lo, hi, modulus: self.modulus, rem: self.rem }.tighten(); }
+        let (m1, r1, m2, r2) = (i128::from(self.modulus), i128::from(self.rem), i128::from(other.modulus), i128::from(other.rem));
+        if r1 < 0 || r1 >= m1 || r2 < 0 || r2 >= m2 { return None; }
+        let (g, s, _) = ext_gcd_i128(m1, m2);
+        let diff = r2 - r1;
+        if diff % g != 0 { return None; }
+        let (m1_g, m2_g) = (m1 / g, m2 / g);
+        let lcm = m1_g.checked_mul(m2)?;
+        let k = ((diff / g).rem_euclid(m2_g) * s.rem_euclid(m2_g)).rem_euclid(m2_g);
+        let r = (r1 + m1 * k).rem_euclid(lcm);
+        let (lo128, hi128) = (i128::from(lo), i128::from(hi));
+        let (nlo, nhi) = (lo128 + (r - lo128.rem_euclid(lcm)).rem_euclid(lcm), hi128 - (hi128.rem_euclid(lcm) - r).rem_euclid(lcm));
+        if nlo > nhi || nlo < i128::from(i64::MIN) || nhi > i128::from(i64::MAX) { return None; }
+        if nlo == nhi { return Some(Self::exact(nlo as i64)); }
+        if lcm <= i128::from(i64::MAX / 2) { Some(Self { lo: nlo as i64, hi: nhi as i64, modulus: lcm as i64, rem: r as i64 }) }
+        else {
+            let (modulus, rem) = if other.modulus > self.modulus { (other.modulus, other.rem) } else { (self.modulus, self.rem) };
+            Self { lo: nlo as i64, hi: nhi as i64, modulus, rem }.tighten()
+        }
     }
     #[must_use] pub fn meet(self, other: Self) -> Self { self.try_meet(other).unwrap_or(self) }
     #[must_use] pub fn join(self, other: Self) -> Self {
@@ -241,6 +270,7 @@ crate::define_ops!(
     @0 pure Param(u8), @0 pure Const(i64), @0s eff Alloc { buf: u8, len: usize }, @0 eff Free(u8),
     @1s eff CheckGen { buf: u8, expected: Id }, @1s eff Load { buf: u8, idx: Id },
     @2s eff Store { buf: u8, idx: Id, val: Id }, @1s pure BoundsCheck { idx: Id, limit: usize },
+    @2 pure DynBoundsCheck(Id, Id), @1t pure PanicIfZero(Id, u8),
     @2 pure Add(Id, Id), @2 pure Sub(Id, Id), @2 pure Mul(Id, Id),
     @2 pure WrapAdd(Id, Id), @2 pure WrapSub(Id, Id), @2 pure WrapMul(Id, Id),
     @2 pure Div(Id, Id), @2 pure Rem(Id, Id), @1t pure Shl(Id, u8), @1t pure Shr(Id, u8),
@@ -255,6 +285,8 @@ impl<Id: Copy> Op<Id> {
             Self::Alloc { .. } => Domain::range(1, i64::MAX), Self::Free(_) => Domain::exact(0),
             Self::CheckGen { expected, .. } => dom(expected), Self::Load { buf, .. } => bdom(buf), Self::Store { val, .. } => dom(val),
             Self::BoundsCheck { idx, limit } => if limit > 0 { dom(idx).meet(Domain::range(0, i64::try_from(limit - 1).unwrap_or(i64::MAX))) } else { Domain::top() },
+            Self::DynBoundsCheck(idx, len) => { let dl = dom(len); if dl.hi > 0 { dom(idx).meet(Domain::range(0, dl.hi - 1)) } else { Domain::top() } }
+            Self::PanicIfZero(cond, _) => dom(cond),
             Self::Add(a, b) | Self::WrapAdd(a, b) => dom(a).eval_add_sub(dom(b), false).0,
             Self::Sub(a, b) | Self::WrapSub(a, b) => dom(a).eval_add_sub(dom(b), true).0,
             Self::Mul(a, b) | Self::WrapMul(a, b) => dom(a).eval_mul(dom(b)).0,
@@ -274,8 +306,9 @@ impl<Id: Copy> Op<Id> {
 
 #[derive(Clone, Debug)]
 pub struct Program {
-    pub name: String, pub bufs: Vec<BufSpec>, pub param_domains: Vec<Domain>,
-    pub nodes: Vec<IrOp>, pub node_guards: Vec<Option<(NodeId, bool)>>, pub outputs: Vec<NodeId>, pub simd_lanes: usize,
+    pub name: String, pub bufs: Vec<BufSpec>, pub param_domains: Vec<Domain>, pub param_names: Vec<String>,
+    pub nodes: Vec<IrOp>, pub node_guards: Vec<Option<(NodeId, bool)>>, pub outputs: Vec<NodeId>,
+    pub simd_lanes: usize, pub check_reg_budget: bool,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ProofStatus { ProvenSafe, DefiniteBug(VerifyError), Uncertain(VerifyError) }
@@ -295,64 +328,222 @@ fn env_dom(env: &BTreeMap<usize, Domain>, base: &[Domain], uf: &[usize], id: Nod
     let r = uf_find(uf, id); env.get(&r).copied().unwrap_or(base[r])
 }
 
+#[derive(Clone, Default)]
+struct RelOverlay { doms: BTreeMap<usize, Domain>, diffs: BTreeMap<(usize, usize), i128> }
+
 #[derive(Clone, Copy)]
 struct GuardCtx<'a> { prog: &'a Program, base: &'a [Domain], uf: &'a [usize] }
 impl GuardCtx<'_> {
-    fn get(self, env: &BTreeMap<usize, Domain>, id: NodeId) -> Domain { env_dom(env, self.base, self.uf, id) }
-    fn tighten(self, env: &mut BTreeMap<usize, Domain>, id: NodeId, bound: Domain) -> Option<()> {
-        let r = uf_find(self.uf, id);
-        let next = self.get(env, r).try_meet(bound)?;
-        env.insert(r, next);
+    fn get(self, ov: &RelOverlay, id: NodeId) -> Domain { env_dom(&ov.doms, self.base, self.uf, id) }
+    fn decompose(self, ov: &RelOverlay, mut id: NodeId) -> (usize, i128) {
+        let mut off = 0i128;
+        for _ in 0..8 {
+            match self.prog.nodes[id] {
+                Op::BoundsCheck { idx, .. } | Op::DynBoundsCheck(idx, _) => id = idx,
+                Op::Add(a, b) | Op::WrapAdd(a, b) => {
+                    let (da, db) = (self.get(ov, a), self.get(ov, b));
+                    if let Some(k) = db.is_const().filter(|&k| !da.eval_add_sub(Domain::exact(k), false).1) {
+                        off += i128::from(k); id = a; continue;
+                    }
+                    if let Some(k) = da.is_const().filter(|&k| !db.eval_add_sub(Domain::exact(k), false).1) {
+                        off += i128::from(k); id = b; continue;
+                    }
+                    break;
+                }
+                Op::Sub(a, b) | Op::WrapSub(a, b) => {
+                    let (da, db) = (self.get(ov, a), self.get(ov, b));
+                    if let Some(k) = db.is_const().filter(|&k| !da.eval_add_sub(Domain::exact(k), true).1) {
+                        off -= i128::from(k); id = a; continue;
+                    }
+                    break;
+                }
+                _ => break,
+            }
+        }
+        (uf_find(self.uf, id), off)
+    }
+    fn diff_ub(self, ov: &RelOverlay, a: NodeId, b: NodeId) -> i128 {
+        let (da, db) = (self.get(ov, a), self.get(ov, b));
+        let mut ub = i128::from(da.hi) - i128::from(db.lo);
+        let ((ra, oa), (rb, ob)) = (self.decompose(ov, a), self.decompose(ov, b));
+        if ra == rb { ub = ub.min(oa - ob); }
+        else if let Some(&w) = ov.diffs.get(&(ra, rb)) { ub = ub.min(w.saturating_add(oa - ob)); }
+        ub
+    }
+    fn eval_rel_cmp(self, ov: &RelOverlay, k: CmpKind, a: NodeId, b: NodeId) -> Option<bool> {
+        if let Some(c) = self.get(ov, a).eval_cmp(k, self.get(ov, b)).is_const() { return Some(c != 0); }
+        let (ab, ba) = (self.diff_ub(ov, a, b), self.diff_ub(ov, b, a));
+        match k {
+            CmpKind::Lt => if ab <= -1 { Some(true) } else if ba <= 0 { Some(false) } else { None },
+            CmpKind::Le => if ab <= 0 { Some(true) } else if ba <= -1 { Some(false) } else { None },
+            CmpKind::Gt => if ba <= -1 { Some(true) } else if ab <= 0 { Some(false) } else { None },
+            CmpKind::Ge => if ba <= 0 { Some(true) } else if ab <= -1 { Some(false) } else { None },
+            CmpKind::Eq => if ab <= 0 && ba <= 0 { Some(true) } else if ab <= -1 || ba <= -1 { Some(false) } else { None },
+            CmpKind::Ne => if ab <= -1 || ba <= -1 { Some(true) } else if ab <= 0 && ba <= 0 { Some(false) } else { None },
+        }
+    }
+    fn eval_rel_bool(self, ov: &RelOverlay, id: NodeId, depth: u8) -> Option<bool> {
+        let d = self.get(ov, id);
+        if d.is_const() == Some(0) { return Some(false); }
+        if !d.contains(0) { return Some(true); }
+        if depth >= 8 { return None; }
         match self.prog.nodes[id] {
-            Op::BoundsCheck { idx, .. } => self.tighten(env, idx, bound)?,
-            Op::BitAnd(x, m_id) => if let (Some(m), Some(rv)) = (self.get(env, m_id).is_const(), next.is_const()) {
+            Op::Cmp(k, a, b) => self.eval_rel_cmp(ov, k, a, b),
+            Op::BitAnd(a, b) | Op::BitOr(a, b) => {
+                let (da, db) = (self.get(ov, a), self.get(ov, b));
+                if da.lo < 0 || da.hi > 1 || db.lo < 0 || db.hi > 1 { return None; }
+                let (va, vb) = (self.eval_rel_bool(ov, a, depth + 1), self.eval_rel_bool(ov, b, depth + 1));
+                if matches!(self.prog.nodes[id], Op::BitAnd(_, _)) {
+                    match (va, vb) { (Some(false), _) | (_, Some(false)) => Some(false), (Some(true), Some(true)) => Some(true), _ => None }
+                } else {
+                    match (va, vb) { (Some(true), _) | (_, Some(true)) => Some(true), (Some(false), Some(false)) => Some(false), _ => None }
+                }
+            }
+            _ => None,
+        }
+    }
+    fn add_diff(self, ov: &mut RelOverlay, u: usize, v: usize, c: i128) -> Option<()> {
+        if u == v { return (c >= 0).then_some(()); }
+        if ov.diffs.get(&(u, v)).is_some_and(|&old| old <= c) { return Some(()); }
+        if ov.diffs.get(&(v, u)).is_some_and(|&rev| c.saturating_add(rev) < 0) { return None; }
+        let mut inc_u = vec![(u, 0i128)];
+        let mut out_v = vec![(v, 0i128)];
+        for (&(x, y), &w) in &ov.diffs {
+            if y == u { inc_u.push((x, w)); }
+            if x == v { out_v.push((y, w)); }
+        }
+        let mut updates = Vec::new();
+        for &(x, w1) in &inc_u {
+            for &(y, w2) in &out_v {
+                let w = w1.saturating_add(c).saturating_add(w2);
+                if x == y { if w < 0 { return None; } continue; }
+                if ov.diffs.get(&(y, x)).is_some_and(|&rev| w.saturating_add(rev) < 0) { return None; }
+                if !ov.diffs.get(&(x, y)).is_some_and(|&old| old <= w) { updates.push((x, y, w)); }
+            }
+        }
+        for (x, y, w) in updates {
+            if ov.diffs.len() >= 128 && !ov.diffs.contains_key(&(x, y)) { continue; }
+            if ov.diffs.get(&(x, y)).is_some_and(|&old| old <= w) { continue; }
+            if ov.diffs.get(&(y, x)).is_some_and(|&rev| w.saturating_add(rev) < 0) { return None; }
+            ov.diffs.insert((x, y), w);
+            let (dx, dy) = (self.get(ov, x), self.get(ov, y));
+            let x_hi = i128::from(dy.hi).saturating_add(w);
+            if x_hi < i128::from(i64::MIN) { return None; }
+            if x_hi < i128::from(dx.hi) { self.tighten(ov, x, Domain::range(i64::MIN, x_hi as i64))?; }
+            let dx2 = self.get(ov, x);
+            let y_lo = i128::from(dx2.lo).saturating_sub(w);
+            if y_lo > i128::from(i64::MAX) { return None; }
+            if y_lo > i128::from(dy.lo) { self.tighten(ov, y, Domain::range(y_lo as i64, i64::MAX))?; }
+        }
+        Some(())
+    }
+    fn add_rel_bound(self, ov: &mut RelOverlay, eff: CmpKind, ra: usize, rb: usize, rhs: i128) -> Option<()> {
+        match eff {
+            CmpKind::Lt => self.add_diff(ov, ra, rb, rhs.saturating_sub(1)),
+            CmpKind::Le => self.add_diff(ov, ra, rb, rhs),
+            CmpKind::Gt => self.add_diff(ov, rb, ra, (-rhs).saturating_sub(1)),
+            CmpKind::Ge => self.add_diff(ov, rb, ra, -rhs),
+            CmpKind::Eq => { self.add_diff(ov, ra, rb, rhs)?; self.add_diff(ov, rb, ra, -rhs) }
+            CmpKind::Ne => if ra == rb && rhs == 0 { None } else { Some(()) },
+        }
+    }
+    fn add_cmp_diff(self, ov: &mut RelOverlay, eff: CmpKind, a: NodeId, b: NodeId) -> Option<()> {
+        if self.eval_rel_cmp(ov, eff, a, b) == Some(false) { return None; }
+        let ((ra, oa), (rb, ob)) = (self.decompose(ov, a), self.decompose(ov, b));
+        self.add_rel_bound(ov, eff, ra, rb, ob - oa)?;
+        for (sub_node, k_opt, rel_eff) in [(a, self.get(ov, b).is_const(), eff), (b, self.get(ov, a).is_const(), eff.flip())] {
+            if let (Op::Sub(x, y) | Op::WrapSub(x, y), Some(k)) = (self.prog.nodes[sub_node], k_opt) {
+                if !self.get(ov, x).eval_add_sub(self.get(ov, y), true).1 {
+                    let ((rx, ox), (ry, oy)) = (self.decompose(ov, x), self.decompose(ov, y));
+                    self.add_rel_bound(ov, rel_eff, rx, ry, i128::from(k) - (ox - oy))?;
+                }
+            }
+        }
+        Some(())
+    }
+    fn tighten(self, ov: &mut RelOverlay, id: NodeId, bound: Domain) -> Option<()> {
+        let r = uf_find(self.uf, id);
+        let next = self.get(ov, r).try_meet(bound)?;
+        ov.doms.insert(r, next);
+        match self.prog.nodes[id] {
+            Op::BoundsCheck { idx, .. } | Op::DynBoundsCheck(idx, _) => self.tighten(ov, idx, bound)?,
+            Op::BitAnd(x, m_id) => if let (Some(m), Some(rv)) = (self.get(ov, m_id).is_const(), next.is_const()) {
                 if m > 0 && m < 64 && ((m + 1) & m) == 0 && rv >= 0 && rv <= m {
-                    let dx = self.get(env, x); self.tighten(env, x, Domain::congruent(dx.lo, dx.hi, m + 1, rv))?;
+                    let dx = self.get(ov, x); self.tighten(ov, x, Domain::congruent(dx.lo, dx.hi, m + 1, rv))?;
+                }
+            },
+            Op::Rem(x, d_id) => if let (Some(d), Some(rv)) = (self.get(ov, d_id).is_const(), next.is_const()) {
+                if d > 1 && d <= i64::MAX / 2 {
+                    if rv <= -d || rv >= d { return None; }
+                    let dx = self.get(ov, x);
+                    let (lo, hi, rem) = if rv > 0 { (dx.lo.max(rv), dx.hi, rv) }
+                        else if rv < 0 { (dx.lo, dx.hi.min(rv), d + rv) }
+                        else { (dx.lo, dx.hi, 0) };
+                    if lo > hi { return None; }
+                    self.tighten(ov, x, Domain::congruent(lo, hi, d, rem))?;
                 }
             },
             _ => {}
         }
         Some(())
     }
-    fn merge_branch(self, env: &mut BTreeMap<usize, Domain>, r1: Option<BTreeMap<usize, Domain>>, r2: Option<BTreeMap<usize, Domain>>) -> Option<()> {
-        *env = match (r1, r2) { (None, None) => return None, (Some(e), None) | (None, Some(e)) => e, (Some(a), Some(b)) => join_envs(self.base, a, b) };
+    fn merge_branch(self, ov: &mut RelOverlay, r1: Option<RelOverlay>, r2: Option<RelOverlay>) -> Option<()> {
+        *ov = match (r1, r2) { (None, None) => return None, (Some(e), None) | (None, Some(e)) => e, (Some(a), Some(b)) => join_rel(self.base, a, b) };
         Some(())
     }
-    fn apply(self, g: NodeId, pol: bool, env: &mut BTreeMap<usize, Domain>, depth: u8) -> Option<()> {
+    fn apply(self, g: NodeId, pol: bool, ov: &mut RelOverlay, depth: u8) -> Option<()> {
         if depth > 16 { return Some(()); }
-        let dg = self.get(env, g);
+        let dg = self.get(ov, g);
         if (pol && dg.is_const() == Some(0)) || (!pol && !dg.contains(0)) { return None; }
-        if !pol { self.tighten(env, g, Domain::exact(0))?; } else if dg == Domain::range(0, 1) { self.tighten(env, g, Domain::exact(1))?; }
+        if !pol { self.tighten(ov, g, Domain::exact(0))?; }
+        else if dg.lo == 0 { self.tighten(ov, g, Domain::range(1, i64::MAX))?; }
+        else if dg.hi == 0 { self.tighten(ov, g, Domain::range(i64::MIN, -1))?; }
         match self.prog.nodes[g] {
             Op::Cmp(k, a, b) => {
-                let (eff, da, db) = (if pol { k } else { k.negate() }, self.get(env, a), self.get(env, b));
+                let (eff, da, db) = (if pol { k } else { k.negate() }, self.get(ov, a), self.get(ov, b));
                 match (eff, da.is_const(), db.is_const()) {
-                    (CmpKind::Eq | CmpKind::Ne, _, Some(0)) => return self.apply(a, eff == CmpKind::Ne, env, depth + 1),
-                    (CmpKind::Eq | CmpKind::Ne, Some(0), _) => return self.apply(b, eff == CmpKind::Ne, env, depth + 1),
-                    _ => { self.tighten(env, a, cmp_bound(eff, da, db)?)?; self.tighten(env, b, cmp_bound(eff.flip(), db, da)?)?; }
+                    (CmpKind::Eq | CmpKind::Ne, _, Some(0)) => {
+                        self.apply(a, eff == CmpKind::Ne, ov, depth + 1)?;
+                        if matches!(self.prog.nodes[a], Op::Sub(_, _) | Op::WrapSub(_, _) | Op::Add(_, _) | Op::WrapAdd(_, _)) {
+                            self.add_cmp_diff(ov, eff, a, b)?;
+                        }
+                        return Some(());
+                    }
+                    (CmpKind::Eq | CmpKind::Ne, Some(0), _) => {
+                        self.apply(b, eff == CmpKind::Ne, ov, depth + 1)?;
+                        if matches!(self.prog.nodes[b], Op::Sub(_, _) | Op::WrapSub(_, _) | Op::Add(_, _) | Op::WrapAdd(_, _)) {
+                            self.add_cmp_diff(ov, eff, a, b)?;
+                        }
+                        return Some(());
+                    }
+                    _ => {
+                        self.tighten(ov, a, cmp_bound(eff, da, db)?)?;
+                        self.tighten(ov, b, cmp_bound(eff.flip(), db, da)?)?;
+                        self.add_cmp_diff(ov, eff, a, b)?;
+                    }
                 }
             }
-            Op::BitAnd(a, b) if pol => { self.apply(a, true, env, depth + 1)?; self.apply(b, true, env, depth + 1)?; }
-            Op::BitOr(a, b) if !pol => { self.apply(a, false, env, depth + 1)?; self.apply(b, false, env, depth + 1)?; }
-            Op::Select { cond, t_val, f_val } => self.apply_select(cond, t_val, f_val, pol, env, depth + 1)?,
+            Op::BitAnd(a, b) if pol => { self.apply(a, true, ov, depth + 1)?; self.apply(b, true, ov, depth + 1)?; }
+            Op::BitOr(a, b) if !pol => { self.apply(a, false, ov, depth + 1)?; self.apply(b, false, ov, depth + 1)?; }
+            Op::Select { cond, t_val, f_val } => self.apply_select(cond, t_val, f_val, pol, ov, depth + 1)?,
             Op::BitOr(a, b) | Op::BitAnd(a, b) => {
-                let (mut e1, mut e2) = (env.clone(), env.clone());
+                let (mut e1, mut e2) = (ov.clone(), ov.clone());
                 let (r1, r2) = (self.apply(a, pol, &mut e1, depth + 1).map(|()| e1), self.apply(b, pol, &mut e2, depth + 1).map(|()| e2));
-                self.merge_branch(env, r1, r2)?;
+                self.merge_branch(ov, r1, r2)?;
             }
             _ => {}
         }
         Some(())
     }
-    fn apply_select(self, cond: NodeId, t_val: NodeId, f_val: NodeId, pol: bool, env: &mut BTreeMap<usize, Domain>, depth: u8) -> Option<()> {
-        let (dt, df) = (self.get(env, t_val), self.get(env, f_val));
-        if (pol && df.is_const() == Some(0)) || (!pol && !df.contains(0)) { self.apply(cond, true, env, depth)?; self.apply(t_val, pol, env, depth)?; }
-        else if (pol && dt.is_const() == Some(0)) || (!pol && !dt.contains(0)) { self.apply(cond, false, env, depth)?; self.apply(f_val, pol, env, depth)?; }
+    fn apply_select(self, cond: NodeId, t_val: NodeId, f_val: NodeId, pol: bool, ov: &mut RelOverlay, depth: u8) -> Option<()> {
+        let (dt, df) = (self.get(ov, t_val), self.get(ov, f_val));
+        if (pol && df.is_const() == Some(0)) || (!pol && !df.contains(0)) { self.apply(cond, true, ov, depth)?; self.apply(t_val, pol, ov, depth)?; }
+        else if (pol && dt.is_const() == Some(0)) || (!pol && !dt.contains(0)) { self.apply(cond, false, ov, depth)?; self.apply(f_val, pol, ov, depth)?; }
         else {
-            let (mut e1, mut e2) = (env.clone(), env.clone());
+            let (mut e1, mut e2) = (ov.clone(), ov.clone());
             let r1 = self.apply(cond, true, &mut e1, depth).and_then(|()| self.apply(t_val, pol, &mut e1, depth)).map(|()| e1);
             let r2 = self.apply(cond, false, &mut e2, depth).and_then(|()| self.apply(f_val, pol, &mut e2, depth)).map(|()| e2);
-            self.merge_branch(env, r1, r2)?;
+            self.merge_branch(ov, r1, r2)?;
         }
         Some(())
     }
@@ -380,11 +571,21 @@ fn join_envs(base: &[Domain], a: BTreeMap<usize, Domain>, b: BTreeMap<usize, Dom
     out
 }
 
+fn join_rel(base: &[Domain], a: RelOverlay, b: RelOverlay) -> RelOverlay {
+    let mut diffs = BTreeMap::new();
+    for (k, wa) in a.diffs { if let Some(&wb) = b.diffs.get(&k) { diffs.insert(k, wa.max(wb)); } }
+    RelOverlay { doms: join_envs(base, a.doms, b.doms), diffs }
+}
+
+fn refine_guard_rel(prog: &Program, g: NodeId, pol: bool, base: &[Domain], uf: &[usize]) -> Option<RelOverlay> {
+    let mut ov = RelOverlay::default();
+    GuardCtx { prog, base, uf }.apply(g, pol, &mut ov, 0)?;
+    Some(ov)
+}
+
 /// Non-contaminating read-only path-refined domain overlay (`None` = algebraically dead branch).
 pub fn refine_guard_env(prog: &Program, g: NodeId, pol: bool, base: &[Domain], uf: &[usize]) -> Option<BTreeMap<usize, Domain>> {
-    let mut env = BTreeMap::new();
-    GuardCtx { prog, base, uf }.apply(g, pol, &mut env, 0)?;
-    Some(env)
+    refine_guard_rel(prog, g, pol, base, uf).map(|ov| ov.doms)
 }
 
 #[derive(Default)]
@@ -545,11 +746,24 @@ fn check_mem_op(id: NodeId, op: IrOp, certain: bool, d_at: &impl Fn(NodeId) -> D
     Ok(())
 }
 
-fn check_arith_op(id: NodeId, op: IrOp, d_at: &impl Fn(NodeId) -> Domain, uf: &[usize], acc: &mut CheckAcc) -> Result<(), VerifyError> {
+fn check_arith_op(id: NodeId, op: IrOp, d_at: &impl Fn(NodeId) -> Domain, gctx: GuardCtx<'_>, ov: &RelOverlay, acc: &mut CheckAcc) -> Result<(), VerifyError> {
     match op {
         Op::BoundsCheck { idx, limit } => acc.idx(id, d_at(idx), limit)?,
+        Op::DynBoundsCheck(idx, len) => {
+            let (di, dl) = (d_at(idx), d_at(len));
+            if dl.hi <= 0 || di.hi < 0 || di.lo >= dl.hi || gctx.diff_ub(ov, len, idx) <= 0 {
+                return Err(VerifyError::OutOfBounds { node: id, idx_lo: di.lo, idx_hi: di.hi, limit: dl.hi.max(0) as usize });
+            }
+            if di.lo >= 0 && (di.hi < dl.lo || gctx.diff_ub(ov, idx, len) <= -1) { acc.proven += 1; }
+            else { acc.mark(VerifyError::OutOfBounds { node: id, idx_lo: di.lo, idx_hi: di.hi, limit: dl.hi.max(0) as usize }); }
+        }
+        Op::PanicIfZero(cond, _) => {
+            let rel_ok = gctx.eval_rel_bool(ov, cond, 0);
+            if rel_ok == Some(false) { return Err(VerifyError::ExplicitPanic { node: id }); }
+            if rel_ok == Some(true) { acc.proven += 1; } else { acc.mark(VerifyError::ExplicitPanic { node: id }); }
+        }
         Op::Add(a, b) | Op::Sub(a, b) => if d_at(a).eval_add_sub(d_at(b), matches!(op, Op::Sub(_, _))).1 { acc.mark(VerifyError::IntOverflow { node: id }); } else { acc.proven += 1; },
-        Op::Mul(a, b) => if if uf_find(uf, a) == uf_find(uf, b) { d_at(a).eval_square().1 } else { d_at(a).eval_mul(d_at(b)).1 } { acc.mark(VerifyError::IntOverflow { node: id }); } else { acc.proven += 1; },
+        Op::Mul(a, b) => if if uf_find(gctx.uf, a) == uf_find(gctx.uf, b) { d_at(a).eval_square().1 } else { d_at(a).eval_mul(d_at(b)).1 } { acc.mark(VerifyError::IntOverflow { node: id }); } else { acc.proven += 1; },
         Op::Div(a, b) | Op::Rem(a, b) => {
             let (da, db) = (d_at(a), d_at(b));
             if db.is_const() == Some(0) || (da.is_const() == Some(i64::MIN) && db.is_const() == Some(-1)) { return Err(VerifyError::DivByZero { node: id }); }
@@ -568,7 +782,7 @@ fn check_arith_op(id: NodeId, op: IrOp, d_at: &impl Fn(NodeId) -> Domain, uf: &[
 
 impl Program {
     #[must_use] pub fn new(name: impl Into<String>) -> Self {
-        Self { name: name.into(), bufs: Vec::new(), param_domains: Vec::new(), nodes: Vec::new(), node_guards: Vec::new(), outputs: Vec::new(), simd_lanes: 8 }
+        Self { name: name.into(), bufs: Vec::new(), param_domains: Vec::new(), param_names: Vec::new(), nodes: Vec::new(), node_guards: Vec::new(), outputs: Vec::new(), simd_lanes: 8, check_reg_budget: true }
     }
     pub fn add_buf(&mut self, name: impl Into<String>, len: usize, mutable: bool, region: u16, offset: usize, elem_domain: Domain) -> u8 {
         let id = self.bufs.len() as u8;
@@ -577,7 +791,13 @@ impl Program {
     pub fn add_uninit_buf(&mut self, name: impl Into<String>, len: usize, mutable: bool, region: u16, offset: usize, elem_domain: Domain) -> u8 {
         let id = self.add_buf(name, len, mutable, region, offset, elem_domain); self.bufs[usize::from(id)].pre_init = false; id
     }
-    pub fn add_param(&mut self, domain: Domain) -> NodeId { let pid = self.param_domains.len() as u8; self.param_domains.push(domain); self.push(Op::Param(pid)) }
+    pub fn add_param(&mut self, domain: Domain) -> NodeId { let pid = self.param_domains.len(); self.add_named_param(format!("p{pid}"), domain) }
+    pub fn add_named_param(&mut self, name: impl Into<String>, domain: Domain) -> NodeId {
+        let pid = self.param_domains.len() as u8;
+        self.param_domains.push(domain);
+        self.param_names.push(name.into());
+        self.push(Op::Param(pid))
+    }
     pub fn push(&mut self, op: IrOp) -> NodeId { self.push_guarded(op, None) }
     pub fn push_guarded(&mut self, op: IrOp, guard: Option<(NodeId, bool)>) -> NodeId { let id = self.nodes.len(); self.nodes.push(op); self.node_guards.push(guard); id }
     #[must_use] pub fn guard_of(&self, id: NodeId) -> Option<(NodeId, bool)> { self.node_guards.get(id).copied().flatten() }
@@ -626,18 +846,21 @@ impl Program {
         for (id, &op) in self.nodes.iter().enumerate() {
             let (g_raw, canon) = (self.guard_of(id), op.map_ids(|k| uf_find(&uf, k)));
             let (overlay, certain) = match g_raw {
-                None => (Some(BTreeMap::new()), true),
+                None => (Some(RelOverlay::default()), true),
                 Some((g, pol)) => {
                     let dg = doms[uf_find(&uf, g)];
-                    (refine_guard_env(self, g, pol, &doms, &uf), if pol { !dg.contains(0) } else { dg.is_const() == Some(0) })
+                    (refine_guard_rel(self, g, pol, &doms, &uf), if pol { !dg.contains(0) } else { dg.is_const() == Some(0) })
                 }
             };
             let Some(ov) = overlay else { continue; };
-            doms[id] = mem.eval(&self.bufs, canon, certain, |k| env_dom(&ov, &doms, &uf, k), pdoms);
+            doms[id] = mem.eval(&self.bufs, canon, certain, |k| env_dom(&ov.doms, &doms, &uf, k), pdoms);
             if g_raw.is_none() {
-                if canon.is_pure() { let prev = *memo.entry((None, canon)).or_insert(id); if prev != id { uf_union(&mut uf, &mut doms, prev, id); } }
+                if canon.is_pure() && !matches!(canon, Op::PanicIfZero(_, _)) {
+                    let prev = *memo.entry((None, canon)).or_insert(id);
+                    if prev != id { uf_union(&mut uf, &mut doms, prev, id); }
+                }
                 apply_egraph_rules(&self.nodes, &mut uf, &mut doms, id, canon);
-                if canon.is_pure() && !matches!(canon, Op::BoundsCheck { .. }) {
+                if canon.is_pure() && !matches!(canon, Op::BoundsCheck { .. } | Op::DynBoundsCheck(_, _) | Op::PanicIfZero(_, _)) {
                     if let Some(c) = doms[uf_find(&uf, id)].is_const() { let prev = *memo.entry((None, Op::Const(c))).or_insert(id); if prev != id { uf_union(&mut uf, &mut doms, prev, id); } }
                 }
             }
@@ -650,16 +873,19 @@ impl Program {
     #[must_use] pub fn check_obligations(&self, pdoms: &[Domain]) -> (Vec<Domain>, ProofStatus, usize) {
         let (doms, uf) = self.infer_domains_with_uf(pdoms);
         let (mut bstates, mut acc): (Vec<BufInitState>, CheckAcc) = (self.bufs.iter().map(BufInitState::from_buf).collect(), CheckAcc::default());
+        let (gctx, empty_ov) = (GuardCtx { prog: self, base: &doms, uf: &uf }, RelOverlay::default());
         for (id, &op) in self.nodes.iter().enumerate() {
-            let (overlay, certain) = match self.guard_of(id) {
-                None => (BTreeMap::new(), true),
+            let (ov, certain) = match self.guard_of(id) {
+                None => (RelOverlay::default(), true),
                 Some((g, pol)) => {
-                    let Some(ov) = refine_guard_env(self, g, pol, &doms, &uf) else { acc.proven += 1; continue; };
-                    (ov, if pol { !doms[g].contains(0) } else { doms[g].is_const() == Some(0) })
+                    let Some(ov) = refine_guard_rel(self, g, pol, &doms, &uf) else { acc.proven += 1; continue; };
+                    (ov, gctx.eval_rel_bool(&empty_ov, g, 0) == Some(pol))
                 }
             };
-            let d_at = |k: NodeId| env_dom(&overlay, &doms, &uf, k);
-            if let Err(bug) = check_mem_op(id, op, certain, &d_at, &uf, &mut bstates, &mut acc).and_then(|()| check_arith_op(id, op, &d_at, &uf, &mut acc)) {
+            let d_at = |k: NodeId| env_dom(&ov.doms, &doms, &uf, k);
+            if let Err(bug) = check_mem_op(id, op, certain, &d_at, &uf, &mut bstates, &mut acc)
+                .and_then(|()| check_arith_op(id, op, &d_at, gctx, &ov, &mut acc))
+            {
                 if certain { return (doms, ProofStatus::DefiniteBug(bug), acc.proven); } else { acc.mark(bug); }
             }
         }
@@ -707,7 +933,7 @@ impl Program {
         let budget = profile.budget();
         let vecs_per_val = if self.simd_lanes == 0 { 0 } else { self.simd_lanes.div_ceil(budget.lanes_i64) };
         let (peak_gprs, peak_vecs) = (self.bufs.len() + peak_ssa, peak_ssa.saturating_mul(vecs_per_val));
-        if peak_gprs > budget.max_gprs || peak_vecs > budget.max_vecs {
+        if self.check_reg_budget && (peak_gprs > budget.max_gprs || peak_vecs > budget.max_vecs) {
             return Err(VerifyError::RegisterSpill { profile, peak_gprs, max_gprs: budget.max_gprs, peak_vecs, max_vecs: budget.max_vecs });
         }
         Ok(ScheduleReport { profile, peak_gprs, peak_vecs, live_nodes })
