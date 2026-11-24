@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use crate::abstract_eval::{ArchProfile, Domain, Program};
 use crate::rust_fe::{tokenize_rust, LoweredFn, PocParam, RustProofReport, Tok, MAX_SYM_SLICE_LEN};
@@ -41,8 +41,7 @@ impl ArgFact {
     fn apply_tz(self) -> Self {
         if let Some(cs) = self.consts.filter(|c| c.len > 0 && c.as_slice().iter().all(|&v| v > 0)) {
             let (mut out, mut ok) = (ConstSet::default(), true); for &v in cs.as_slice() { ok &= out.push(i64::from((v as u64).trailing_zeros())); }
-            let dom = out.dom(); return Self { s: CallerArgSummary { dom, ..CallerArgSummary::default() }, consts: ok.then_some(out), nz_dom: dom, from_param: None };
-        }
+            let dom = out.dom(); return Self { s: CallerArgSummary { dom, ..CallerArgSummary::default() }, consts: ok.then_some(out), nz_dom: dom, from_param: None }; }
         if let Some(d) = self.s.pow2.then_some(self.s.dom).flatten().filter(|d| d.lo >= 2 && d.hi >= d.lo) {
             let (lo, hi) = (i64::from((d.lo as u64).next_power_of_two().trailing_zeros()), i64::from(63u32.saturating_sub((d.hi as u64).leading_zeros())));
             if lo <= hi { let dom = Domain::range(lo, hi); return Self { s: CallerArgSummary { dom: Some(dom), ..CallerArgSummary::default() }, consts: None, nz_dom: Some(dom), from_param: None }; }
@@ -71,8 +70,7 @@ fn skip_bal(toks: &[Tok], mut i: usize, end: usize, open: &str, close: &str) -> 
             Some(Tok::Sym(s)) if *s == close => d = d.saturating_sub(1),
             Some(Tok::Sym(">>")) if is_ang => d = d.saturating_sub(2), _ => {}
         }
-        i = i.saturating_add(1);
-    }
+        i = i.saturating_add(1); }
     i
 }
 fn parse_attr_is_test(toks: &[Tok], i: &mut usize, end: usize) -> bool {
@@ -87,8 +85,7 @@ fn parse_fn_params(toks: &[Tok], mut i: usize, end: usize) -> (bool, Vec<String>
         let (pstart, mut d) = (i, 0usize);
         while i < end {
             match toks.get(i) { Some(Tok::Sym("(" | "[" | "{" | "<")) => d = d.saturating_add(1), Some(Tok::Sym(")" | "]" | "}" | ">")) => d = d.saturating_sub(1), Some(Tok::Sym(">>")) => d = d.saturating_sub(2), Some(Tok::Sym(",")) if d == 0 => break, _ => {} }
-            i = i.saturating_add(1);
-        }
+            i = i.saturating_add(1); }
         let seg = toks.get(pstart..i).unwrap_or(&[]); if i < end { i = i.saturating_add(1); }
         if seg.iter().take(4).any(|t| matches!(t, Tok::Ident(w) if w == "self")) { has_self = true; }
         else if let Some(c) = seg.iter().position(|t| matches!(t, Tok::Sym(":"))) {
@@ -105,7 +102,7 @@ fn scan_cg_block(toks: &[Tok], start: usize, end: usize, file_idx: usize, self_t
             Some(Tok::Sym("#")) => { is_test |= parse_attr_is_test(toks, &mut i, end); }
             Some(Tok::Ident(w)) if w == "pub" => { i = i.saturating_add(1); if matches!(toks.get(i), Some(Tok::Sym("("))) { i = skip_bal(toks, i, end, "(", ")"); vis = 1; } else { vis = 2; } }
             Some(Tok::Ident(w)) if matches!(w.as_str(), "async" | "unsafe" | "const" | "default") => i = i.saturating_add(1),
-            Some(Tok::Ident(w)) if w == "extern" => { i = i.saturating_add(1); if matches!(toks.get(i), Some(Tok::Sym("\""))) { i = i.saturating_add(1); } }
+            Some(Tok::Ident(w)) if w == "extern" => { i = i.saturating_add(1); if matches!(toks.get(i), Some(Tok::Str(_, _))) { i = i.saturating_add(1); } }
             Some(Tok::Ident(w)) if w == "mod" || w == "impl" => {
                 let (is_impl, t) = (w == "impl", is_test); is_test = false; vis = 0; i = i.saturating_add(1); if is_impl { i = skip_bal(toks, i, end, "<", ">"); }
                 let (mut ty_name, mut after_for) = (None::<String>, false);
@@ -151,8 +148,7 @@ fn find_top_pred(toks: &[Tok], s: usize, e: usize, pred: impl Fn(&Tok, Option<&T
             if d == 0 && pred(t, toks.get(i.saturating_add(1))) { return Some(i); }
             match t { Tok::Sym("(" | "[" | "{") => d = d.saturating_add(1), Tok::Sym(")" | "]" | "}") => d = d.saturating_sub(1), _ => {} }
         }
-        i = i.saturating_add(1);
-    }
+        i = i.saturating_add(1); }
     None
 }
 fn find_top(toks: &[Tok], s: usize, e: usize, sym: &str) -> Option<usize> { find_top_pred(toks, s, e, |t, _| matches!(t, Tok::Sym(x) if *x == sym)) }
@@ -169,8 +165,7 @@ fn apply_cmp_var(env: &mut BTreeMap<String, ArgFact>, var: &str, op: &str, k: i6
     if is_len {
         let m = MAX_SYM_SLICE_LEN as i64;
         let d = match op { "==" => Domain::exact(k), "<" => Domain::range(0, k.saturating_sub(1)), "<=" => Domain::range(0, k), ">" => Domain::range(k.saturating_add(1), m), ">=" => Domain::range(k, m), _ => return };
-        f.s.slice_len = ArgFact::idom(f.s.slice_len, d); return;
-    }
+        f.s.slice_len = ArgFact::idom(f.s.slice_len, d); return; }
     match op {
         "==" => { f.s.dom = Some(Domain::exact(k)); f.consts = Some(ConstSet::single(k)); if k != 0 { f.nz_dom = Some(Domain::exact(k)); } }
         "!=" => {
@@ -204,8 +199,7 @@ fn refine_cond(env: &mut BTreeMap<String, ArgFact>, toks: &[Tok], s: usize, e: u
                 }
             }
         }
-        return;
-    }
+        return; }
     if let Some(p) = find_top(toks, s, e, "||") { if !truth { refine_cond(env, toks, s, p, false); refine_cond(env, toks, p.saturating_add(1), e, false); } return; }
     if matches!(toks.get(s), Some(Tok::Sym("!"))) { refine_cond(env, toks, s.saturating_add(1), e, !truth); return; }
     let sl = toks.get(s..e).unwrap_or(&[]);
@@ -213,8 +207,7 @@ fn refine_cond(env: &mut BTreeMap<String, ArgFact>, toks: &[Tok], s: usize, e: u
     if let [Tok::Ident(v), Tok::Sym("."), Tok::Ident(m), Tok::Sym("("), Tok::Sym(")")] = sl {
         if m == "is_empty" { apply_cmp_var(env, v, if truth { "==" } else { ">=" }, i64::from(!truth), true); }
         else if m == "is_power_of_two" && truth { env.entry(v.clone()).or_default().s.pow2 = true; }
-        return;
-    }
+        return; }
     for op in ["==", "!=", "<=", ">=", "<", ">"] {
         if let Some(p) = find_top(toks, s, e, op) {
             let eff = if truth { op } else { match op { "==" => "!=", "!=" => "==", "<" => ">=", "<=" => ">", ">" => "<=", _ => "<" } };
@@ -222,8 +215,7 @@ fn refine_cond(env: &mut BTreeMap<String, ArgFact>, toks: &[Tok], s: usize, e: u
             if let Some(k) = parse_int_slice(rhs) {
                 match lhs { [Tok::Ident(v)] => apply_cmp_var(env, v, eff, k, false), [Tok::Ident(v), Tok::Sym("."), Tok::Ident(m), Tok::Sym("("), Tok::Sym(")")] if m == "len" => apply_cmp_var(env, v, eff, k, true), _ => {} }
             }
-            return;
-        }
+            return; }
     }
 }
 struct ExtractCtx<'a> { toks: &'a [Tok], caller: usize, file_idx: usize, calls: &'a mut Vec<CallSite> }
@@ -264,8 +256,7 @@ impl<'a> ExtractCtx<'a> {
                 else if matches!(self.toks.get(es), Some(Tok::Sym("{"))) { let ee = skip_bal(self.toks, es, e, "{", "}"); (ee, self.scan_block(es.saturating_add(1), ee.saturating_sub(1), &mut eenv), block_diverges(self.toks, es.saturating_add(1), ee.saturating_sub(1))) }
                 else { (es, ArgFact::default(), false) };
             if !as_expr { if t_div && !ed { *env = eenv; } else if ed && !t_div { *env = tenv; } }
-            return (ep, if t_div { ev } else if ed { t_val } else { t_val.join(ev) });
-        }
+            return (ep, if t_div { ev } else if ed { t_val } else { t_val.join(ev) }); }
         if !as_expr {
             if t_div { refine_cond(env, self.toks, s.saturating_add(1), j, false); }
             else { for (k, tv) in tenv { if let Some(ov) = env.get(&k).copied().filter(|&ov| ov != tv) { env.insert(k, ov.join(tv)); } } }
@@ -281,8 +272,7 @@ impl<'a> ExtractCtx<'a> {
         if matches!(sl, [Tok::Ident(w)] if w == "None") { return ArgFact::opt(0, None); }
         if let [Tok::Ident(w)] = sl { return env.get(w).copied().unwrap_or_default(); }
         if matches!(sl.first(), Some(Tok::Ident(w)) if w == "Some") && matches!(sl.get(1), Some(Tok::Sym("("))) && skip_bal(self.toks, s.saturating_add(1), e, "(", ")") == e {
-            return ArgFact::opt(1, self.eval_expr(s.saturating_add(2), e.saturating_sub(1), env).s.dom);
-        }
+            return ArgFact::opt(1, self.eval_expr(s.saturating_add(2), e.saturating_sub(1), env).s.dom); }
         if let [Tok::Ident(v), Tok::Sym("."), Tok::Ident(m), Tok::Sym("("), Tok::Sym(")")] = sl {
             if m == "trailing_zeros" { let b = env.get(v).copied().unwrap_or_default(); return if let Some((p, false)) = b.from_param { ArgFact { from_param: Some((p, true)), ..b } } else { b.apply_tz() }; }
         }
@@ -307,12 +297,10 @@ impl<'a> ExtractCtx<'a> {
                     let is_method = i > s && matches!(self.toks.get(i.saturating_sub(1)), Some(Tok::Sym(".")));
                     let is_self = is_method && i >= s.saturating_add(2) && matches!(self.toks.get(i.saturating_sub(2)), Some(Tok::Ident(w)) if w == "self");
                     let qual = (!is_method && i >= s.saturating_add(2) && matches!(self.toks.get(i.saturating_sub(1)), Some(Tok::Sym("::")))).then(|| match self.toks.get(i.saturating_sub(2)) { Some(Tok::Ident(q)) => Some(q.clone()), _ => None }).flatten();
-                    self.calls.push(CallSite { caller: self.caller, file_idx: self.file_idx, qual, short: name.clone(), is_method, is_self, args }); i = ce; continue;
-                }
+                    self.calls.push(CallSite { caller: self.caller, file_idx: self.file_idx, qual, short: name.clone(), is_method, is_self, args }); i = ce; continue; }
             }
             if matches!(self.toks.get(i), Some(Tok::Sym("{"))) { let be = skip_bal(self.toks, i, e, "{", "}"); let mut sub = env.clone(); let _ = self.scan_block(i.saturating_add(1), be.saturating_sub(1), &mut sub); i = be; continue; }
-            i = i.saturating_add(1);
-        }
+            i = i.saturating_add(1); }
         ArgFact::default()
     }
     fn scan_block(&mut self, s: usize, e: usize, env: &mut BTreeMap<String, ArgFact>) -> ArgFact {
@@ -337,24 +325,20 @@ impl<'a> ExtractCtx<'a> {
                         else { let _ = self.eval_expr(rs, re, env); }
                         i = re.saturating_add(1).min(e);
                     } else { i = eq.saturating_add(1).min(e); }
-                    last = ArgFact::default();
-                }
+                    last = ArgFact::default(); }
                 Some(Tok::Ident(w)) if w == "if" => { let (np, v) = self.scan_if(i, e, env, false); i = np; last = v; }
                 Some(Tok::Ident(w)) if w == "match" => { let mut j = i.saturating_add(1); while j < e && !matches!(self.toks.get(j), Some(Tok::Sym("{"))) { j = j.saturating_add(1); } let be = skip_bal(self.toks, j, e, "{", "}"); last = self.eval_match(i.saturating_add(1), be, env, 0).0; i = be; }
                 Some(Tok::Ident(w)) if matches!(w.as_str(), "assert" | "debug_assert") && matches!(self.toks.get(i.saturating_add(1)), Some(Tok::Sym("!"))) => {
                     let pe = skip_bal(self.toks, i.saturating_add(2), e, "(", ")");
                     let ce = find_top(self.toks, i.saturating_add(3), pe.saturating_sub(1), ",").unwrap_or_else(|| pe.saturating_sub(1));
-                    refine_cond(env, self.toks, i.saturating_add(3), ce, true); i = pe; last = ArgFact::default();
-                }
+                    refine_cond(env, self.toks, i.saturating_add(3), ce, true); i = pe; last = ArgFact::default(); }
                 Some(Tok::Ident(w)) if matches!(w.as_str(), "while" | "for" | "loop") => {
                     let mut j = i.saturating_add(1); while j < e && !matches!(self.toks.get(j), Some(Tok::Sym("{"))) { j = j.saturating_add(1); }
                     let be = skip_bal(self.toks, j, e, "{", "}"); let mut lenv = env.clone(); if w == "while" { refine_cond(&mut lenv, self.toks, i.saturating_add(1), j, true); }
-                    let _ = self.scan_block(j.saturating_add(1), be.saturating_sub(1), &mut lenv); i = be; last = ArgFact::default();
-                }
+                    let _ = self.scan_block(j.saturating_add(1), be.saturating_sub(1), &mut lenv); i = be; last = ArgFact::default(); }
                 Some(Tok::Ident(v)) if matches!(self.toks.get(i.saturating_add(1)), Some(Tok::Sym("="))) => {
                     let re = find_top(self.toks, i.saturating_add(2), e, ";").unwrap_or(e);
-                    let f = self.eval_expr(i.saturating_add(2), re, env); env.insert(v.clone(), f); i = re.saturating_add(1).min(e); last = ArgFact::default();
-                }
+                    let f = self.eval_expr(i.saturating_add(2), re, env); env.insert(v.clone(), f); i = re.saturating_add(1).min(e); last = ArgFact::default(); }
                 Some(Tok::Sym("{")) => { let be = skip_bal(self.toks, i, e, "{", "}"); let mut sub = env.clone(); last = self.scan_block(i.saturating_add(1), be.saturating_sub(1), &mut sub); i = be; }
                 _ => { let se = find_top(self.toks, i, e, ";").unwrap_or(e); let v = self.eval_expr(i, se, env); last = if se < e { ArgFact::default() } else { v }; i = se.saturating_add(1).min(e); }
             }
@@ -372,8 +356,7 @@ fn find_workspace_root(dir: &Path) -> (Option<PathBuf>, bool) {
     if toml.contains(".workspace = true") || toml.contains(".workspace=true") {
         let mut anc = cd.parent();
         for _ in 0..2 { if let Some(a) = anc { if std::fs::read_dir(a).ok().map_or(0, |rd| rd.flatten().filter(|e| e.path().join("Cargo.toml").is_file()).count()) >= 2 { return (Some(a.to_path_buf()), false); } anc = a.parent(); } }
-        return (None, false);
-    }
+        return (None, false); }
     (None, toml.contains("[package]") && !cd.join("src/main.rs").is_file() && !cd.join("main.rs").is_file() && !toml.contains("publish = false") && !toml.contains("publish=false"))
 }
 fn collect_sibling_rs(root: &Path, skip: &[String], skip_tests: bool, out: &mut Vec<PathBuf>) {
@@ -393,7 +376,7 @@ fn narrow_program(lf: &LoweredFn, facts: &[ArgFact]) -> Option<Program> {
         let mut apply = |pidx: usize, d: Domain| { if let Some(slot) = prog.param_domains.get_mut(pidx) { if let Some(nd) = slot.try_meet(d).filter(|&nd| nd != *slot) { *slot = nd; narrowed = true; } } };
         match *pp {
             PocParam::Scalar { pidx, .. } => if let Some(d) = fact.s.dom { apply(pidx, d); },
-            PocParam::Slice { pidx, .. } => if let Some(d) = fact.s.slice_len { apply(pidx, d); },
+            PocParam::Slice { pidx, .. } | PocParam::Str { pidx, .. } => if let Some(d) = fact.s.slice_len { apply(pidx, d); },
             PocParam::Opt { is_some, val, .. } => {
                 if let Some(d) = fact.s.opt_is_some { apply(is_some, d); }
                 if let Some(d) = fact.s.dom { apply(val, d); }
@@ -403,34 +386,93 @@ fn narrow_program(lf: &LoweredFn, facts: &[ArgFact]) -> Option<Program> {
     }
     narrowed.then_some(prog)
 }
+type IncomingEdges = Vec<Vec<(usize, Vec<ArgFact>)>>;
+const MAX_INCOMING_EDGES: usize = 64;
+const MAX_AMBIGUOUS_BUCKET: usize = 32;
+struct CgIndex<'a> {
+    by_file_full: HashMap<(usize, &'a str), usize>,
+    by_method: HashMap<(&'a str, usize), Vec<usize>>,
+    by_file_method: HashMap<(usize, &'a str, usize), Vec<usize>>,
+    by_type_assoc: HashMap<(&'a str, &'a str, usize), Vec<usize>>,
+    by_file_free: HashMap<(usize, &'a str, usize), Vec<usize>>,
+    by_free: HashMap<(&'a str, usize), Vec<usize>>,
+}
+impl<'a> CgIndex<'a> {
+    fn build(fns: &'a [CgFn]) -> Self {
+        let mut idx = Self {
+            by_file_full: HashMap::with_capacity(fns.len()),
+            by_method: HashMap::new(), by_file_method: HashMap::new(),
+            by_type_assoc: HashMap::new(), by_file_free: HashMap::new(), by_free: HashMap::new(),
+        };
+        for (fid, f) in fns.iter().enumerate() {
+            idx.by_file_full.entry((f.file_idx, f.full_name.as_str())).or_insert(fid); let ar = f.params.len();
+            if f.has_self {
+                idx.by_method.entry((f.short_name.as_str(), ar)).or_default().push(fid);
+                idx.by_file_method.entry((f.file_idx, f.short_name.as_str(), ar)).or_default().push(fid);
+            } else if let Some(ref st) = f.self_ty {
+                idx.by_type_assoc.entry((st.as_str(), f.short_name.as_str(), ar)).or_default().push(fid);
+            } else {
+                idx.by_file_free.entry((f.file_idx, f.short_name.as_str(), ar)).or_default().push(fid); idx.by_free.entry((f.short_name.as_str(), ar)).or_default().push(fid);
+            }
+        }
+        idx
+    }
+    fn mark_ambiguous(&self, fns: &[CgFn], ambiguous: &mut [bool]) {
+        for b in self.by_method.values().chain(self.by_free.values()) {
+            if b.len() > MAX_AMBIGUOUS_BUCKET {
+                for &fid in b { if fns.get(fid).is_some_and(|f| f.vis >= 1) { if let Some(slot) = ambiguous.get_mut(fid) { *slot = true; } } }
+            }
+        }
+    }
+}
+fn push_call_edge(tgt: usize, c: &CallSite, incoming: &mut [Vec<(usize, Vec<ArgFact>)>], ambiguous: &mut [bool]) {
+    if tgt == c.caller { return; }
+    if let Some(slot) = incoming.get_mut(tgt) {
+        if slot.len() < MAX_INCOMING_EDGES { slot.push((c.caller, c.args.clone())); }
+        else if let Some(a) = ambiguous.get_mut(tgt) { *a = true; }
+    }
+}
 fn visible_to(f: &CgFn, c_file: usize, n_target: usize) -> bool { f.file_idx == c_file || f.vis == 2 || (f.vis >= 1 && f.file_idx < n_target && c_file < n_target) }
-fn resolve_call_targets(c: &CallSite, fns: &[CgFn], n_target: usize) -> Vec<usize> {
+fn add_call_edges(c: &CallSite, fns: &[CgFn], idx: &CgIndex<'_>, n_target: usize, incoming: &mut [Vec<(usize, Vec<ArgFact>)>], ambiguous: &mut [bool]) {
     let ar = c.args.len();
     if c.is_method {
         if c.is_self {
             let ct = fns.get(c.caller).and_then(|f| f.self_ty.as_deref());
-            let same: Vec<usize> = fns.iter().enumerate().filter(|(_, f)| f.file_idx == c.file_idx && f.has_self && f.short_name == c.short && f.params.len() == ar && f.self_ty.as_deref() == ct).map(|(i, _)| i).collect();
-            if !same.is_empty() { return same; }
+            if let Some(loc) = idx.by_file_method.get(&(c.file_idx, c.short.as_str(), ar)) {
+                let mut hit = false;
+                for &fid in loc { if fns.get(fid).is_some_and(|f| f.self_ty.as_deref() == ct) { push_call_edge(fid, c, incoming, ambiguous); hit = true; } }
+                if hit { return; }
+            }
         }
-        return fns.iter().enumerate().filter(|(_, f)| f.has_self && f.short_name == c.short && f.params.len() == ar && visible_to(f, c.file_idx, n_target)).map(|(i, _)| i).collect();
-    }
+        if let Some(b) = idx.by_method.get(&(c.short.as_str(), ar)) {
+            if b.len() > MAX_AMBIGUOUS_BUCKET {
+                if let Some(loc) = idx.by_file_method.get(&(c.file_idx, c.short.as_str(), ar)) { for &fid in loc { push_call_edge(fid, c, incoming, ambiguous); } }
+            } else {
+                for &fid in b { if fns.get(fid).is_some_and(|f| visible_to(f, c.file_idx, n_target)) { push_call_edge(fid, c, incoming, ambiguous); } }
+            }
+        }
+        return; }
     if let Some(ref q) = c.qual {
-        let bt: Vec<usize> = fns.iter().enumerate().filter(|(_, f)| !f.has_self && f.short_name == c.short && f.params.len() == ar && f.self_ty.as_deref() == Some(q.as_str())).map(|(i, _)| i).collect();
-        if !bt.is_empty() { return bt; }
-        return fns.iter().enumerate().filter(|(_, f)| !f.has_self && f.self_ty.is_none() && f.short_name == c.short && f.params.len() == ar && visible_to(f, c.file_idx, n_target)).map(|(i, _)| i).collect();
+        let q_ty = if q == "Self" { fns.get(c.caller).and_then(|f| f.self_ty.as_deref()).unwrap_or(q.as_str()) } else { q.as_str() };
+        if let Some(bt) = idx.by_type_assoc.get(&(q_ty, c.short.as_str(), ar)) {
+            if !bt.is_empty() { for &fid in bt { push_call_edge(fid, c, incoming, ambiguous); } return; }
+        }
+    } else if let Some(loc) = idx.by_file_free.get(&(c.file_idx, c.short.as_str(), ar)) {
+        if !loc.is_empty() { for &fid in loc { push_call_edge(fid, c, incoming, ambiguous); } return; }
     }
-    let loc: Vec<usize> = fns.iter().enumerate().filter(|(_, f)| f.file_idx == c.file_idx && !f.has_self && f.self_ty.is_none() && f.short_name == c.short && f.params.len() == ar).map(|(i, _)| i).collect();
-    if !loc.is_empty() { return loc; }
-    fns.iter().enumerate().filter(|(_, f)| !f.has_self && f.self_ty.is_none() && f.short_name == c.short && f.params.len() == ar && visible_to(f, c.file_idx, n_target)).map(|(i, _)| i).collect()
+    if let Some(b) = idx.by_free.get(&(c.short.as_str(), ar)) {
+        if b.len() > MAX_AMBIGUOUS_BUCKET {
+            if let Some(loc) = idx.by_file_free.get(&(c.file_idx, c.short.as_str(), ar)) { for &fid in loc { push_call_edge(fid, c, incoming, ambiguous); } }
+        } else {
+            for &fid in b { if fns.get(fid).is_some_and(|f| visible_to(f, c.file_idx, n_target)) { push_call_edge(fid, c, incoming, ambiguous); } }
+        }
+    }
 }
-fn extract_all_calls(fns: &[CgFn], all_toks: &[Vec<Tok>]) -> Vec<CallSite> {
-    let mut calls = Vec::new();
-    for (fid, f) in fns.iter().enumerate() {
-        let Some(toks) = all_toks.get(f.file_idx) else { continue; };
+fn extract_calls_range(fns: &[CgFn], start: usize, all_toks: &[Vec<Tok>], calls: &mut Vec<CallSite>) {
+    for (off, f) in fns.get(start..).unwrap_or(&[]).iter().enumerate() {
+        let fid = start.saturating_add(off); let Some(toks) = all_toks.get(f.file_idx) else { continue; };
         let mut env: BTreeMap<String, ArgFact> = f.params.iter().enumerate().map(|(pi, n)| (n.clone(), ArgFact { from_param: Some((pi, false)), ..ArgFact::default() })).collect();
-        let mut ec = ExtractCtx { toks, caller: fid, file_idx: f.file_idx, calls: &mut calls }; let _ = ec.scan_block(f.body.0, f.body.1, &mut env);
-    }
-    calls
+        let mut ec = ExtractCtx { toks, caller: fid, file_idx: f.file_idx, calls }; let _ = ec.scan_block(f.body.0, f.body.1, &mut env); }
 }
 fn pub_pat(f: &CgFn) -> String { f.self_ty.as_ref().map_or_else(|| format!("{}(", f.short_name), |st| format!("{st}::{}(", f.short_name)) }
 pub(crate) fn apply_interprocedural_reachability(
@@ -441,16 +483,20 @@ pub(crate) fn apply_interprocedural_reachability(
     let ((ws_root, standalone_lib), n_target) = (dir.map_or((None, false), find_workspace_root), file_srcs.len());
     let mut all_toks: Vec<Vec<Tok>> = file_srcs.iter().map(|s| tokenize_rust(s)).collect(); let mut fns: Vec<CgFn> = Vec::new();
     for (fi, toks) in all_toks.iter().enumerate() { scan_cg_block(toks, 0, toks.len(), fi, None, skip_cfg_test, &mut fns); }
+    let mut calls = Vec::new(); extract_calls_range(&fns, 0, &all_toks, &mut calls);
     if let Some(root) = ws_root {
-        let (mut known, mut pool, mut frontier) = (files.iter().cloned().collect::<BTreeSet<_>>(), Vec::new(), BTreeSet::<String>::new());
+        let (mut known, mut pool, mut frontier, mut fshorts) = (files.iter().cloned().collect::<BTreeSet<_>>(), Vec::new(), BTreeSet::<String>::new(), HashSet::<String>::new());
+        let init_map: HashMap<(usize, &str), usize> = fns.iter().enumerate().map(|(i, f)| ((f.file_idx, f.full_name.as_str()), i)).collect();
         collect_sibling_rs(&root, skip, skip_cfg_test, &mut pool);
         for &(ridx, fidx, _) in failed_lowered {
             if let Some(fail) = reports.get(ridx).and_then(|r| r.failed.get(fidx)) {
-                if let Some(cf) = fns.iter().find(|f| f.file_idx == ridx && f.full_name == fail.fn_name && f.vis == 2) { frontier.insert(format!("{}(", cf.short_name)); }
+                if let Some(&fid) = init_map.get(&(ridx, fail.fn_name.as_str())) {
+                    if let Some(cf) = fns.get(fid).filter(|f| f.vis == 2) { frontier.insert(format!("{}(", cf.short_name)); fshorts.insert(cf.short_name.clone()); }
+                }
             }
         }
-        for c in extract_all_calls(&fns, &all_toks) { if frontier.contains(&format!("{}(", c.short)) { if let Some(cf) = fns.get(c.caller).filter(|f| f.vis == 2) { frontier.insert(pub_pat(cf)); } } }
-        let mut seen = frontier.clone();
+        for c in &calls { if fshorts.contains(&c.short) { if let Some(cf) = fns.get(c.caller).filter(|f| f.vis == 2) { frontier.insert(pub_pat(cf)); } } }
+        let (mut seen, base_fns) = (frontier.clone(), fns.len());
         for _ in 0..3 {
             if frontier.is_empty() || all_toks.len() >= n_target.saturating_add(128) { break; }
             let pats: Vec<String> = frontier.iter().cloned().collect(); frontier.clear();
@@ -459,38 +505,51 @@ pub(crate) fn apply_interprocedural_reachability(
                 let Ok(src) = std::fs::read_to_string(p) else { continue; }; if !pats.iter().any(|pat| src.contains(pat.as_str())) { continue; }
                 known.insert(p.clone()); let (fi, toks, prev) = (all_toks.len(), tokenize_rust(&src), fns.len()); scan_cg_block(&toks, 0, toks.len(), fi, None, skip_cfg_test, &mut fns);
                 for nf in fns.get(prev..).unwrap_or(&[]) { if nf.vis == 2 { let k = pub_pat(nf); if seen.insert(k.clone()) { frontier.insert(k); } } }
-                all_toks.push(toks);
+                all_toks.push(toks); }
+        }
+        extract_calls_range(&fns, base_fns, &all_toks, &mut calls); }
+    let idx = CgIndex::build(&fns); let (mut incoming, mut ambiguous): (IncomingEdges, Vec<bool>) = (vec![Vec::new(); fns.len()], vec![false; fns.len()]);
+    idx.mark_ambiguous(&fns, &mut ambiguous);
+    for c in &calls { add_call_edges(c, &fns, &idx, n_target, &mut incoming, &mut ambiguous); }
+    let (mut relevant, mut rel_seen, mut rq) = (Vec::new(), HashSet::new(), VecDeque::new());
+    for &(ridx, fidx, _) in failed_lowered {
+        if let Some(fail) = reports.get(ridx).and_then(|r| r.failed.get(fidx)) {
+            if let Some(&fid) = idx.by_file_full.get(&(ridx, fail.fn_name.as_str())) {
+                if rel_seen.insert(fid) { relevant.push(fid); rq.push_back((fid, 0usize)); }
             }
         }
     }
-    let mut incoming: Vec<Vec<(usize, Vec<ArgFact>)>> = vec![Vec::new(); fns.len()];
-    for c in extract_all_calls(&fns, &all_toks) { for tgt in resolve_call_targets(&c, &fns, n_target) { if tgt != c.caller { if let Some(slot) = incoming.get_mut(tgt) { slot.push((c.caller, c.args.clone())); } } } }
+    while let Some((cur, depth)) = rq.pop_front() {
+        if depth >= 12 { continue; }
+        for &(caller, _) in incoming.get(cur).map_or(&[][..], Vec::as_slice) {
+            if rel_seen.insert(caller) { relevant.push(caller); rq.push_back((caller, depth.saturating_add(1))); }
+        }
+    }
     let mut in_params: Vec<Option<Vec<ArgFact>>> = vec![None; fns.len()];
     for _ in 0..6 {
-        let mut next = in_params.clone();
-        for (tgt, edges) in incoming.iter().enumerate() {
+        let mut updates: Vec<(usize, Option<Vec<ArgFact>>)> = Vec::with_capacity(relevant.len());
+        for &tgt in &relevant {
             let mut acc: Option<Vec<ArgFact>> = None;
-            for (caller, raw) in edges {
+            for (caller, raw) in incoming.get(tgt).map_or(&[][..], Vec::as_slice) {
                 let res: Vec<ArgFact> = raw.iter().map(|a| a.resolve(in_params.get(*caller).and_then(|o| o.as_deref()))).collect();
-                acc = Some(acc.map_or(res.clone(), |p| p.into_iter().zip(res).map(|(x, y)| x.join(y)).collect()));
-            }
-            if let Some(slot) = next.get_mut(tgt) { *slot = acc; }
-        }
-        in_params = next;
+                acc = Some(acc.map_or(res.clone(), |p| p.into_iter().zip(res).map(|(x, y)| x.join(y)).collect())); }
+            updates.push((tgt, acc)); }
+        for (tgt, acc) in updates { if let Some(slot) = in_params.get_mut(tgt) { *slot = acc; } }
     }
     let (mut to_sup, mut traces) = (BTreeMap::<(usize, usize), SuppressedHelper>::new(), BTreeMap::<(usize, usize), Vec<String>>::new());
     for &(ridx, fidx, ref lf) in failed_lowered {
         let Some(fail) = reports.get(ridx).and_then(|r| r.failed.get(fidx)) else { continue; };
-        let Some(fid) = fns.iter().position(|f| f.file_idx == ridx && f.full_name == fail.fn_name) else { traces.insert((ridx, fidx), vec![fail.fn_name.clone()]); continue; };
-        let edges = incoming.get(fid).map_or(&[][..], Vec::as_slice);
+        let Some(&fid) = idx.by_file_full.get(&(ridx, fail.fn_name.as_str())) else { traces.insert((ridx, fidx), vec![fail.fn_name.clone()]); continue; };
+        let edges = incoming.get(fid).map_or(&[][..], Vec::as_slice); let is_amb = ambiguous.get(fid).copied().unwrap_or(false);
         if edges.is_empty() || (standalone_lib && fns.get(fid).is_some_and(|f| f.vis == 2)) { traces.insert((ridx, fidx), vec![fail.fn_name.clone()]); continue; }
-        if in_params.get(fid).and_then(|o| o.as_deref()).and_then(|j| narrow_program(lf, j)).is_some_and(|np| verify_program(&np, profile, cfg).is_ok()) {
+        if !is_amb && in_params.get(fid).and_then(|o| o.as_deref()).and_then(|j| narrow_program(lf, j)).is_some_and(|np| verify_program(&np, profile, cfg).is_ok()) {
             to_sup.insert((ridx, fidx), SuppressedHelper { fn_name: fail.fn_name.clone(), caller_count: edges.len(), reason: format!("all {} callers discharge precondition", edges.len()) }); continue;
         }
-        let (mut q, mut vis, mut best) = (VecDeque::new(), BTreeSet::from([fid]), vec![fid]);
+        let (mut q, mut vis, mut best, mut vcache) = (VecDeque::new(), BTreeSet::from([fid]), vec![fid], HashMap::<Vec<Domain>, bool>::new());
         for (caller, raw) in edges {
             let res: Vec<ArgFact> = raw.iter().map(|a| a.resolve(in_params.get(*caller).and_then(|o| o.as_deref()))).collect();
-            if !narrow_program(lf, &res).is_some_and(|np| verify_program(&np, profile, cfg).is_ok()) && vis.insert(*caller) { q.push_back((*caller, vec![fid, *caller])); }
+            let safe = narrow_program(lf, &res).is_some_and(|np| *vcache.entry(np.param_domains.clone()).or_insert_with(|| verify_program(&np, profile, cfg).is_ok()));
+            if !safe && vis.insert(*caller) { q.push_back((*caller, vec![fid, *caller])); }
         }
         while let Some((cur, path)) = q.pop_front() {
             if path.len() > best.len() { best = path.clone(); }

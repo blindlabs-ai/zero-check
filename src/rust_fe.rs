@@ -4,6 +4,9 @@ use crate::abstract_eval::{ArchProfile, CmpKind, Domain, IrOp, Op, Program, Veri
 use crate::simd_fuzz::{fault_name, refine_and_fuzz, sample_counterexample, Counterexample, RefineConfig};
 use crate::{verify_program, ProgramReport};
 pub const MAX_SYM_SLICE_LEN: usize = 65_536;
+type LoopMutKey = (String, Option<String>);
+type LoopMutMap = BTreeMap<LoopMutKey, u8>;
+type LoopPreMap = BTreeMap<LoopMutKey, (usize, Option<ScalarTy>)>;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RustFeOptions { pub skip_cfg_test: bool, pub enforce_reg_budget: bool, pub interprocedural_reachability: bool }
 impl Default for RustFeOptions { fn default() -> Self { Self { skip_cfg_test: false, enforce_reg_budget: true, interprocedural_reachability: false } } }
@@ -38,7 +41,7 @@ impl ScalarTy {
     }
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum Tok { Ident(String), Int(i64, Option<ScalarTy>), Doc(String), Sym(&'static str) }
+pub(crate) enum Tok { Ident(String), Int(i64, Option<ScalarTy>), Str(usize, bool), Doc(String), Sym(&'static str) }
 fn is_intrinsic(name: &str) -> bool { matches!(name, "zero_alloc" | "zero_free" | "zero_check_gen" | "zero_uninit_read" | "zero_uninit_write") }
 fn parse_int_tok(raw: &str) -> Option<(i64, Option<ScalarTy>)> {
     let clean: String = raw.chars().filter(|&c| c != '_').collect();
@@ -61,6 +64,19 @@ fn parse_byte_lit(b: &[u8], i: &mut usize) -> Option<Tok> {
     } else { let c = *b.get(k)?; k += 1; c }; if *b.get(k)? != b'\'' { return None; }
     *i = k + 1; Some(Tok::Int(i64::from(val), Some(ScalarTy::U8)))
 }
+fn scan_quoted_str(b: &[u8], i: &mut usize) -> (usize, bool) {
+    let (n, mut len, mut ascii) = (b.len(), 0usize, true); *i += 1;
+    while *i < n {
+        let c = b.get(*i).copied().unwrap_or(0);
+        if c == b'\\' && *i + 1 < n {
+            let e = b.get(*i + 1).copied().unwrap_or(0);
+            if e == b'u' { ascii = false; }
+            len += 1; *i += 2;
+        } else if c == b'"' { *i += 1; break; }
+        else { if c >= 0x80 { ascii = false; } len += 1; *i += 1; }
+    }
+    (len, ascii)
+}
 fn skip_quoted(b: &[u8], i: &mut usize, quote: u8) {
     let n = b.len(); *i += 1;
     while *i < n {
@@ -81,15 +97,15 @@ pub(crate) fn tokenize_rust(src: &str) -> Vec<Tok> {
             while i < n && d > 0 { if b[i..].starts_with(b"/*") { d += 1; i += 2; } else if b[i..].starts_with(b"*/") { d -= 1; i += 2; } else { i += 1; } }
         } else if c0 == b'b' && b.get(i + 1) == Some(&b'\'') {
             if let Some(t) = parse_byte_lit(b, &mut i) { out.push(t); } else { skip_quoted(b, &mut i, b'\''); out.push(Tok::Sym("@")); }
-        } else if c0 == b'b' && b.get(i + 1) == Some(&b'"') { i += 1; skip_quoted(b, &mut i, b'"'); out.push(Tok::Sym("\"")); }
+        } else if c0 == b'b' && b.get(i + 1) == Some(&b'"') { i += 1; let (l, a) = scan_quoted_str(b, &mut i); out.push(Tok::Str(l, a)); }
         else if c0 == b'r' && matches!(b.get(i + 1), Some(&b'"' | &b'#')) {
             let (mut k, mut hashes) = (i + 1, 0usize); while b.get(k) == Some(&b'#') { hashes += 1; k += 1; }
             if b.get(k) == Some(&b'"') {
-                k += 1;
-                while k < n { if b.get(k) == Some(&b'"') && b.get(k + 1..k + 1 + hashes).is_some_and(|s| s.iter().all(|&x| x == b'#')) { k += 1 + hashes; break; } k += 1; }
-                i = k; out.push(Tok::Sym("\""));
+                k += 1; let s0 = k;
+                while k < n { if b.get(k) == Some(&b'"') && b.get(k + 1..k + 1 + hashes).is_some_and(|s| s.iter().all(|&x| x == b'#')) { let raw = &b[s0..k]; i = k + 1 + hashes; out.push(Tok::Str(raw.len(), raw.is_ascii())); break; } k += 1; }
+                if i < k { i = k; out.push(Tok::Str(0, false)); }
             } else { i += 1; out.push(Tok::Ident("r".to_string())); }
-        } else if c0 == b'"' { skip_quoted(b, &mut i, b'"'); out.push(Tok::Sym("\"")); }
+        } else if c0 == b'"' { let (l, a) = scan_quoted_str(b, &mut i); out.push(Tok::Str(l, a)); }
         else if c0 == b'\'' {
             if b.get(i + 1) == Some(&b'\\') || b.get(i + 2) == Some(&b'\'') { skip_quoted(b, &mut i, b'\''); out.push(Tok::Sym("@")); }
             else { i += 1; while i < n && b.get(i).is_some_and(|c| c.is_ascii_alphanumeric() || *c == b'_') { i += 1; } }
@@ -196,14 +212,16 @@ impl<'a> Cursor<'a> {
         if name == "zero_uninit" { return (None, true, None, is_test); }
         let mut text = String::new();
         for t in slice.get(1..).unwrap_or(&[]) {
-            match t { Tok::Ident(s) => { text.push(' '); text.push_str(s); } Tok::Int(v, _) => { text.push(' '); text.push_str(&v.to_string()); } Tok::Sym(s) => text.push_str(s), Tok::Doc(_) => {} }
+            match t { Tok::Ident(s) => { text.push(' '); text.push_str(s); } Tok::Int(v, _) => { text.push(' '); text.push_str(&v.to_string()); } Tok::Sym(s) => text.push_str(s), Tok::Doc(_) | Tok::Str(_, _) => {} }
         }
         if name == "zero_domain" && slice.len() >= 3 { (collect_domain_spec(&text, &mut meta.domains), false, None, is_test) }
         else if name == "zero_region" { (None, false, parse_pair_region(&text), is_test) } else { (None, false, None, is_test) }
     }
 }
-struct FnItem { name: String, sig_pos: usize, meta: FnMeta, self_ty: Option<String>, is_test: bool, is_async: bool, is_unsafe: bool }
-struct StructDef { fields: Vec<(String, ScalarTy)> }
+struct FnItem { name: String, sig_pos: usize, meta: FnMeta, self_ty: Option<String>, is_test: bool, is_async: bool, is_unsafe: bool, is_pub: bool, in_generic_impl: bool }
+#[derive(Clone, Copy, Debug)]
+enum FieldTy { Scalar(ScalarTy), Slice(ScalarTy, bool), Str, Opaque }
+struct StructDef { fields: Vec<(String, FieldTy)> }
 struct EnumDef { variants: BTreeMap<String, i64>, max_disc: i64 }
 #[derive(Default)]
 struct FileIndex {
@@ -223,8 +241,7 @@ impl FileIndex {
                     let (sub, base) = (c.expect_ident()?, if nm == "Self" { self_ty.unwrap_or(&nm) } else { nm.as_str() });
                     if let Some(st) = self.resolve_scalar(base) { return Some((st.assoc_const(&sub)?, Some(st))); }
                     if let Some(e) = self.enums.get(base) { return Some((*e.variants.get(&sub)?, Some(ScalarTy::Usize))); }
-                    return self.consts.get(&format!("{base}::{sub}")).copied();
-                }
+                    return self.consts.get(&format!("{base}::{sub}")).copied(); }
                 self.consts.get(&nm).copied()
             }
             _ => None,
@@ -238,8 +255,7 @@ impl FileIndex {
             v = match op {
                 "+" => v.checked_add(r)?, "-" => v.checked_sub(r)?, "*" => v.checked_mul(r)?, "/" => v.checked_div(r)?, "%" => v.checked_rem(r)?, "|" => v | r, "&" => v & r, "^" => v ^ r,
                 "<<" if (0..64).contains(&r) => v.checked_shl(r as u32)?, ">>" if (0..64).contains(&r) => v.checked_shr(r as u32)?, _ => return None,
-            };
-        }
+            }; }
         if c.eat_ident("as") { let dt = self.resolve_scalar(&c.expect_ident()?)?; let (lo, hi) = dt.bounds(); if v < lo || v > hi { return None; } ty = Some(dt); }
         Some((v, ty))
     }
@@ -254,15 +270,27 @@ fn scan_const_item(c: &mut Cursor<'_>, idx: &mut FileIndex, prefix: Option<&str>
     }
     while let Some(t) = c.next() { match t { Tok::Sym(";") => break, Tok::Sym("{") => { c.pos -= 1; c.skip_balanced("{", "}"); } Tok::Sym("[") => { c.pos -= 1; c.skip_balanced("[", "]"); } _ => {} } }
 }
+fn classify_field_ty(sl: &[Tok], idx: &FileIndex) -> FieldTy {
+    match sl {
+        [Tok::Ident(s)] => idx.resolve_scalar(s).map_or_else(|| if s == "String" { FieldTy::Str } else { FieldTy::Opaque }, FieldTy::Scalar),
+        [Tok::Sym("&"), Tok::Ident(s)] if s == "str" || s == "String" => FieldTy::Str,
+        [Tok::Sym("&"), Tok::Ident(m), Tok::Ident(s)] if m == "mut" && s == "str" => FieldTy::Str,
+        [Tok::Sym("&"), Tok::Sym("["), Tok::Ident(e), Tok::Sym("]")] => idx.resolve_scalar(e).map_or(FieldTy::Opaque, |t| FieldTy::Slice(t, false)),
+        [Tok::Sym("&"), Tok::Ident(m), Tok::Sym("["), Tok::Ident(e), Tok::Sym("]")] if m == "mut" => idx.resolve_scalar(e).map_or(FieldTy::Opaque, |t| FieldTy::Slice(t, true)),
+        _ => FieldTy::Opaque,
+    }
+}
 fn scan_aggregate_item(c: &mut Cursor<'_>, idx: &mut FileIndex, is_enum: bool) {
-    let Some(name) = c.expect_ident() else { return; }; if matches!(c.peek(), Some(Tok::Sym("<"))) || !c.eat_sym("{") { c.skip_item_body(); return; }
+    let Some(name) = c.expect_ident() else { return; };
+    if matches!(c.peek(), Some(Tok::Sym("<"))) { c.skip_angles(); }
+    if c.eat_ident("where") { c.skip_until("{", ";", false); }
+    if !c.eat_sym("{") { c.skip_item_body(); return; }
     if is_enum {
         let (mut variants, mut next_val, mut max_disc, mut ok) = (BTreeMap::new(), 0i64, 0i64, true);
         while !c.eat_sym("}") {
             c.skip_doc_and_attrs(); let Some(vname) = c.expect_ident() else { ok = false; break; }; if matches!(c.peek(), Some(Tok::Sym("(" | "{"))) { ok = false; break; }
             let v = if c.eat_sym("=") { if let Some((ev, _)) = idx.eval_const_expr(c, None) { ev } else { ok = false; break; } } else { next_val };
-            variants.insert(vname, v); max_disc = max_disc.max(v); next_val = v.saturating_add(1); let _ = c.eat_sym(",");
-        }
+            variants.insert(vname, v); max_disc = max_disc.max(v); next_val = v.saturating_add(1); let _ = c.eat_sym(","); }
         if !ok { c.skip_rest_of_braces(); return; }
         if !variants.is_empty() && variants.values().all(|&v| v >= 0) { idx.enums.insert(name, EnumDef { variants, max_disc }); }
     } else {
@@ -270,88 +298,104 @@ fn scan_aggregate_item(c: &mut Cursor<'_>, idx: &mut FileIndex, is_enum: bool) {
         while !c.eat_sym("}") {
             c.skip_doc_and_attrs(); if c.eat_ident("pub") && matches!(c.peek(), Some(Tok::Sym("("))) { c.skip_balanced("(", ")"); }
             let Some(fname) = c.expect_ident() else { ok = false; break; }; if !c.eat_sym(":") { ok = false; break; }
-            let Some(ty) = c.expect_ident().and_then(|s| idx.resolve_scalar(&s)) else { ok = false; break; }; fields.push((fname, ty)); let _ = c.eat_sym(",");
-        }
+            let (ts, mut d) = (c.pos, 0usize);
+            while let Some(t) = c.peek() {
+                match t {
+                    Tok::Sym("," | "}") if d == 0 => break,
+                    Tok::Sym("(" | "[" | "<" | "{") => { d += 1; c.pos += 1; }
+                    Tok::Sym(")" | "]" | ">" | "}") => { d = d.saturating_sub(1); c.pos += 1; }
+                    Tok::Sym(">>") => { d = d.saturating_sub(2); c.pos += 1; }
+                    _ => c.pos += 1,
+                }
+            }
+            let fty = classify_field_ty(c.toks.get(ts..c.pos).unwrap_or(&[]), idx); fields.push((fname, fty)); let _ = c.eat_sym(","); }
         if !ok { c.skip_rest_of_braces(); return; }
-        if !fields.is_empty() && fields.len() <= 8 { idx.structs.insert(name, StructDef { fields }); }
+        let has_known = fields.iter().any(|(_, t)| !matches!(t, FieldTy::Opaque));
+        if has_known && fields.len() <= 16 { idx.structs.insert(name, StructDef { fields }); }
     }
 }
-fn scan_fn_decl(c: &mut Cursor<'_>, idx: &mut FileIndex, self_ty: Option<String>, meta: FnMeta, (is_test, is_async, is_unsafe): (bool, bool, bool)) {
+fn scan_fn_decl(c: &mut Cursor<'_>, idx: &mut FileIndex, self_ty: Option<String>, meta: FnMeta, (is_test, is_async, is_unsafe, is_pub, in_generic_impl): (bool, bool, bool, bool, bool)) {
     let raw = c.expect_ident().unwrap_or_else(|| "<anon>".to_string()); let (sig_pos, name) = (c.pos, self_ty.as_ref().map_or_else(|| raw.clone(), |t| format!("{t}::{raw}")));
     c.skip_until("{", ";", false);
-    if matches!(c.peek(), Some(Tok::Sym("{"))) { c.skip_balanced("{", "}"); idx.fns.push(FnItem { name, sig_pos, meta, self_ty, is_test, is_async, is_unsafe }); } else { let _ = c.eat_sym(";"); }
+    if matches!(c.peek(), Some(Tok::Sym("{"))) { c.skip_balanced("{", "}"); idx.fns.push(FnItem { name, sig_pos, meta, self_ty, is_test, is_async, is_unsafe, is_pub, in_generic_impl }); } else { let _ = c.eat_sym(";"); }
 }
 fn scan_impl_block(c: &mut Cursor<'_>, idx: &mut FileIndex, impl_test: bool) {
-    if !c.eat_empty_generics() { c.skip_item_body(); return; }
-    let Some(ty_name) = c.expect_ident() else { c.skip_item_body(); return; }; if !c.eat_empty_generics() || !c.eat_sym("{") { c.skip_item_body(); return; }
-    let (mut pending, mut fn_test, mut fn_async, mut fn_unsafe) = (FnMeta::default(), false, false, false);
+    let gpos = c.pos; let in_generic_impl = !c.eat_empty_generics(); if in_generic_impl { c.pos = gpos; c.skip_angles(); }
+    let (mut ty_name, mut after_for) = (None, false);
+    while let Some(t) = c.peek() {
+        match t {
+            Tok::Sym("{" | ";") => break,
+            Tok::Ident(w) if w == "for" => { after_for = true; ty_name = None; c.pos += 1; }
+            Tok::Ident(w) if w == "where" => { c.skip_until("{", ";", false); break; }
+            Tok::Ident(w) if !matches!(w.as_str(), "dyn" | "mut" | "const") => { if ty_name.is_none() || after_for { ty_name = Some(w.clone()); } c.pos += 1; }
+            Tok::Sym("<") => c.skip_angles(), Tok::Sym("(") => c.skip_balanced("(", ")"), _ => c.pos += 1,
+        }
+    }
+    let Some(ty_name) = ty_name else { c.skip_item_body(); return; };
+    if !c.eat_sym("{") { c.skip_item_body(); return; }
+    let (mut pending, mut fn_test, mut fn_async, mut fn_unsafe, mut fn_pub) = (FnMeta::default(), false, false, false, false);
     while !c.eat_sym("}") {
         match c.peek() {
             None => break,
             Some(Tok::Doc(line)) => { parse_doc_meta(line, &mut pending); c.pos += 1; }
             Some(Tok::Sym("#")) => { let (_, _, _, t) = c.parse_attr(&mut pending); fn_test |= t; }
-            Some(Tok::Ident(w)) if w == "pub" => { c.pos += 1; if matches!(c.peek(), Some(Tok::Sym("("))) { c.skip_balanced("(", ")"); } }
+            Some(Tok::Ident(w)) if w == "pub" => { fn_pub = true; c.pos += 1; if matches!(c.peek(), Some(Tok::Sym("("))) { c.skip_balanced("(", ")"); } }
             Some(Tok::Ident(w)) if w == "const" => {
                 c.pos += 1; if matches!(c.peek(), Some(Tok::Ident(n)) if matches!(n.as_str(), "fn" | "unsafe" | "async" | "extern")) { continue; }
-                scan_const_item(c, idx, Some(&ty_name)); (pending, fn_test, fn_async, fn_unsafe) = (FnMeta::default(), false, false, false);
-            }
+                scan_const_item(c, idx, Some(&ty_name)); (pending, fn_test, fn_async, fn_unsafe, fn_pub) = (FnMeta::default(), false, false, false, false); }
             Some(Tok::Ident(w)) if w == "unsafe" => {
                 c.pos += 1;
                 if matches!(c.peek(), Some(Tok::Ident(n)) if matches!(n.as_str(), "fn" | "async" | "extern")) { fn_unsafe = true; }
-                else { c.skip_item_body(); (pending, fn_test, fn_async, fn_unsafe) = (FnMeta::default(), false, false, false); }
+                else { c.skip_item_body(); (pending, fn_test, fn_async, fn_unsafe, fn_pub) = (FnMeta::default(), false, false, false, false); }
             }
-            Some(Tok::Ident(w)) if w == "extern" => { c.pos += 1; if matches!(c.peek(), Some(Tok::Sym("\""))) { c.pos += 1; } }
+            Some(Tok::Ident(w)) if w == "extern" => { c.pos += 1; if matches!(c.peek(), Some(Tok::Str(_, _))) { c.pos += 1; } }
             Some(Tok::Ident(w)) if w == "async" => {
                 c.pos += 1;
                 if matches!(c.peek(), Some(Tok::Ident(n)) if matches!(n.as_str(), "fn" | "unsafe")) { fn_async = true; }
-                else { c.skip_item_body(); (pending, fn_test, fn_async, fn_unsafe) = (FnMeta::default(), false, false, false); }
+                else { c.skip_item_body(); (pending, fn_test, fn_async, fn_unsafe, fn_pub) = (FnMeta::default(), false, false, false, false); }
             }
             Some(Tok::Ident(w)) if w == "fn" => {
-                c.pos += 1; let flags = (impl_test || std::mem::take(&mut fn_test), std::mem::take(&mut fn_async), std::mem::take(&mut fn_unsafe));
-                scan_fn_decl(c, idx, Some(ty_name.clone()), std::mem::take(&mut pending), flags);
-            }
-            Some(Tok::Sym("{")) => { (pending, fn_test, fn_async, fn_unsafe) = (FnMeta::default(), false, false, false); c.skip_balanced("{", "}"); }
-            _ => { (pending, fn_test, fn_async, fn_unsafe) = (FnMeta::default(), false, false, false); c.pos += 1; }
+                c.pos += 1; let flags = (impl_test || std::mem::take(&mut fn_test), std::mem::take(&mut fn_async), std::mem::take(&mut fn_unsafe), std::mem::take(&mut fn_pub), in_generic_impl);
+                scan_fn_decl(c, idx, Some(ty_name.clone()), std::mem::take(&mut pending), flags); }
+            Some(Tok::Sym("{")) => { (pending, fn_test, fn_async, fn_unsafe, fn_pub) = (FnMeta::default(), false, false, false, false); c.skip_balanced("{", "}"); }
+            _ => { (pending, fn_test, fn_async, fn_unsafe, fn_pub) = (FnMeta::default(), false, false, false, false); c.pos += 1; }
         }
     }
 }
 fn scan_file(toks: &[Tok]) -> FileIndex {
-    let (mut c, mut idx, mut pending, mut is_test, mut is_async, mut is_unsafe) = (Cursor { toks, pos: 0 }, FileIndex::default(), FnMeta::default(), false, false, false);
+    let (mut c, mut idx, mut pending, mut is_test, mut is_async, mut is_unsafe, mut is_pub) = (Cursor { toks, pos: 0 }, FileIndex::default(), FnMeta::default(), false, false, false, false);
     while let Some(tok) = c.peek() {
         match tok {
             Tok::Doc(line) => { parse_doc_meta(line, &mut pending); c.pos += 1; }
             Tok::Sym("#") => { let (_, _, _, t) = c.parse_attr(&mut pending); is_test |= t; }
-            Tok::Ident(w) if w == "pub" => { c.pos += 1; if matches!(c.peek(), Some(Tok::Sym("("))) { c.skip_balanced("(", ")"); } }
+            Tok::Ident(w) if w == "pub" => { is_pub = true; c.pos += 1; if matches!(c.peek(), Some(Tok::Sym("("))) { c.skip_balanced("(", ")"); } }
             Tok::Ident(w) if w == "unsafe" => {
                 c.pos += 1;
                 if matches!(c.peek(), Some(Tok::Ident(n)) if matches!(n.as_str(), "fn" | "async" | "extern")) { is_unsafe = true; }
-                else { c.skip_item_body(); (pending, is_test, is_async, is_unsafe) = (FnMeta::default(), false, false, false); }
+                else { c.skip_item_body(); (pending, is_test, is_async, is_unsafe, is_pub) = (FnMeta::default(), false, false, false, false); }
             }
-            Tok::Ident(w) if w == "extern" => { c.pos += 1; if matches!(c.peek(), Some(Tok::Sym("\""))) { c.pos += 1; } }
+            Tok::Ident(w) if w == "extern" => { c.pos += 1; if matches!(c.peek(), Some(Tok::Str(_, _))) { c.pos += 1; } }
             Tok::Ident(w) if w == "const" => {
                 c.pos += 1; if matches!(c.peek(), Some(Tok::Ident(n)) if matches!(n.as_str(), "fn" | "unsafe" | "async" | "extern")) { continue; }
-                scan_const_item(&mut c, &mut idx, None); (pending, is_test, is_async, is_unsafe) = (FnMeta::default(), false, false, false);
-            }
+                scan_const_item(&mut c, &mut idx, None); (pending, is_test, is_async, is_unsafe, is_pub) = (FnMeta::default(), false, false, false, false); }
             Tok::Ident(w) if w == "type" => {
                 c.pos += 1;
                 if let Some(nm) = c.expect_ident() { if c.eat_sym("=") { if let Some(ty) = c.expect_ident().and_then(|s| idx.resolve_scalar(&s)) { idx.type_aliases.insert(nm, ty); } } }
                 while let Some(t) = c.next() { if matches!(t, Tok::Sym(";")) { break; } }
-                (pending, is_test, is_async, is_unsafe) = (FnMeta::default(), false, false, false);
-            }
-            Tok::Ident(w) if w == "struct" || w == "enum" => { let ie = w == "enum"; c.pos += 1; scan_aggregate_item(&mut c, &mut idx, ie); (pending, is_test, is_async, is_unsafe) = (FnMeta::default(), false, false, false); }
-            Tok::Ident(w) if w == "impl" => { c.pos += 1; let it = std::mem::take(&mut is_test); (pending, is_async, is_unsafe) = (FnMeta::default(), false, false); scan_impl_block(&mut c, &mut idx, it); }
-            Tok::Ident(w) if matches!(w.as_str(), "mod" | "trait") => { c.pos += 1; c.skip_item_body(); (pending, is_test, is_async, is_unsafe) = (FnMeta::default(), false, false, false); }
+                (pending, is_test, is_async, is_unsafe, is_pub) = (FnMeta::default(), false, false, false, false); }
+            Tok::Ident(w) if w == "struct" || w == "enum" => { let ie = w == "enum"; c.pos += 1; scan_aggregate_item(&mut c, &mut idx, ie); (pending, is_test, is_async, is_unsafe, is_pub) = (FnMeta::default(), false, false, false, false); }
+            Tok::Ident(w) if w == "impl" => { c.pos += 1; let it = std::mem::take(&mut is_test); (pending, is_async, is_unsafe, is_pub) = (FnMeta::default(), false, false, false); scan_impl_block(&mut c, &mut idx, it); }
+            Tok::Ident(w) if matches!(w.as_str(), "mod" | "trait") => { c.pos += 1; c.skip_item_body(); (pending, is_test, is_async, is_unsafe, is_pub) = (FnMeta::default(), false, false, false, false); }
             Tok::Ident(w) if w == "async" => {
                 c.pos += 1;
                 if matches!(c.peek(), Some(Tok::Ident(n)) if matches!(n.as_str(), "fn" | "unsafe")) { is_async = true; }
-                else { c.skip_item_body(); (pending, is_test, is_async, is_unsafe) = (FnMeta::default(), false, false, false); }
+                else { c.skip_item_body(); (pending, is_test, is_async, is_unsafe, is_pub) = (FnMeta::default(), false, false, false, false); }
             }
             Tok::Ident(w) if w == "fn" => {
-                c.pos += 1; let flags = (std::mem::take(&mut is_test), std::mem::take(&mut is_async), std::mem::take(&mut is_unsafe));
-                scan_fn_decl(&mut c, &mut idx, None, std::mem::take(&mut pending), flags);
-            }
-            Tok::Sym("{") => { (pending, is_test, is_async, is_unsafe) = (FnMeta::default(), false, false, false); c.skip_balanced("{", "}"); }
-            _ => { (pending, is_test, is_async, is_unsafe) = (FnMeta::default(), false, false, false); c.pos += 1; }
+                c.pos += 1; let flags = (std::mem::take(&mut is_test), std::mem::take(&mut is_async), std::mem::take(&mut is_unsafe), std::mem::take(&mut is_pub), false);
+                scan_fn_decl(&mut c, &mut idx, None, std::mem::take(&mut pending), flags); }
+            Tok::Sym("{") => { (pending, is_test, is_async, is_unsafe, is_pub) = (FnMeta::default(), false, false, false, false); c.skip_balanced("{", "}"); }
+            _ => { (pending, is_test, is_async, is_unsafe, is_pub) = (FnMeta::default(), false, false, false, false); c.pos += 1; }
         }
     }
     idx
@@ -359,7 +403,7 @@ fn scan_file(toks: &[Tok]) -> FileIndex {
 #[derive(Clone, Copy, Debug)]
 struct BufBind {
     id: u8, base_const: usize, base_node: Option<usize>, len_const: usize, len_node: Option<usize>,
-    root_len: Option<usize>, mutable: bool, elem_ty: ScalarTy,
+    root_len: Option<usize>, mutable: bool, elem_ty: ScalarTy, is_str: bool,
 }
 #[derive(Clone, Debug)]
 enum Val { Scalar(usize, Option<ScalarTy>), Opt { is_some: usize, payload: Box<Val> }, Tuple(Vec<Val>), Struct(String, Vec<(String, Val)>), Buf(BufBind), Opaque }
@@ -373,8 +417,16 @@ type ParsedPocEntries = (FileIndex, Vec<LoweredFn>, Vec<String>);
 #[derive(Clone, Debug)]
 pub(crate) enum PocParam {
     Scalar { name: String, ty: ScalarTy, pidx: usize, by_ref: bool, mutable: bool }, Array { name: String, ety: ScalarTy, len: usize, by_ref: bool, mutable: bool },
-    Slice { name: String, ety: ScalarTy, pidx: usize, mutable: bool }, Opt { name: String, ty: ScalarTy, is_some: usize, val: usize },
+    Slice { name: String, ety: ScalarTy, pidx: usize, mutable: bool }, Str { name: String, pidx: usize, owned: bool }, Opt { name: String, ty: ScalarTy, is_some: usize, val: usize },
     Struct { name: String, ty: String, fields: StructFields, by_ref: bool, mutable: bool }, Enum { name: String, ty: String, pidx: usize, by_ref: bool },
+}
+#[derive(Clone, Default)]
+struct Utf8State {
+    str_ascii: BTreeSet<u8>, char_bounds: BTreeSet<(u8, usize)>, ascii_at_idx: BTreeSet<(u8, usize)>,
+    starts_lens: BTreeSet<(u8, i64)>, ends_lens: BTreeSet<(u8, i64)>, find_lits: BTreeMap<(u8, usize), i64>, find_dyn: BTreeMap<(u8, usize), usize>,
+    ascii_preds: BTreeMap<usize, u8>, cb_preds: BTreeMap<usize, (u8, usize)>,
+    starts_preds: BTreeMap<usize, (u8, i64)>, ends_preds: BTreeMap<usize, (u8, i64)>,
+    ascii_byte_preds: BTreeMap<usize, (u8, usize)>, byte_loads: BTreeMap<usize, (u8, usize)>,
 }
 fn scalar_id(v: &Val) -> Option<(usize, Option<ScalarTy>)> { if let &Val::Scalar(id, ty) = v { Some((id, ty)) } else { None } }
 fn bin_prec(sym: &str) -> Option<u8> {
@@ -382,8 +434,8 @@ fn bin_prec(sym: &str) -> Option<u8> {
 }
 struct LowerCtx<'a> {
     prog: Program, poc_params: Vec<PocParam>, vars: BTreeMap<String, Val>, mut_refs: BTreeSet<String>, stores: Vec<usize>, cur_guard: Option<(usize, bool)>,
-    early_rets: Vec<(usize, Val)>, file: &'a FileIndex, toks: &'a [Tok], depth: u8, inlined_fns: &'a mut BTreeSet<String>,
-    next_region: u16, self_ty: Option<String>, no_struct_lit: bool, returns_opt: bool, is_async: bool, has_opaque: bool,
+    early_rets: Vec<(usize, Val)>, file: &'a FileIndex, toks: &'a [Tok], depth: u8, loop_depth: u8, in_loop: bool, inlined_fns: &'a mut BTreeSet<String>,
+    next_region: u16, self_ty: Option<String>, no_struct_lit: bool, returns_opt: bool, is_async: bool, has_opaque: bool, utf8: Utf8State,
 }
 impl<'a> LowerCtx<'a> {
     fn push_g(&mut self, op: IrOp) -> usize { self.prog.push_guarded(op, self.cur_guard) }
@@ -406,8 +458,7 @@ impl<'a> LowerCtx<'a> {
     fn store_guarded(&mut self, buf: u8, idx: usize, val: usize, lo: usize, hi: usize) {
         let (z, old_g) = (self.prog.push(Op::Const(0)), self.cur_guard); let (ge, lt) = (self.push_g(Op::Cmp(CmpKind::Ge, idx, lo)), self.push_g(Op::Cmp(CmpKind::Lt, idx, hi)));
         let ok = self.push_g(Op::Select { cond: ge, t_val: lt, f_val: z }); self.cur_guard = self.and_guard(old_g, (ok, true));
-        let st = self.push_g(Op::Store { buf, idx, val }); self.stores.push(st); self.cur_guard = old_g;
-    }
+        let st = self.push_g(Op::Store { buf, idx, val }); self.stores.push(st); self.cur_guard = old_g; }
     fn zero_like(&mut self, v: &Val) -> Val {
         match v {
             Val::Scalar(_, ty) => Val::Scalar(self.prog.push(Op::Const(0)), *ty),
@@ -450,12 +501,10 @@ impl<'a> LowerCtx<'a> {
     fn emit_range_check(&mut self, val: usize, ty: ScalarTy) {
         if !ty.is_narrow() { return; }
         let (lo, hi) = ty.bounds(); if !ty.is_unsigned() { let lok = self.prog.push(Op::Const(lo)); let ge = self.push_g(Op::Cmp(CmpKind::Ge, val, lok)); self.push_g(Op::PanicIfZero(ge, 4)); }
-        let hik = self.prog.push(Op::Const(hi)); let le = self.push_g(Op::Cmp(CmpKind::Le, val, hik)); self.push_g(Op::PanicIfZero(le, 4));
-    }
+        let hik = self.prog.push(Op::Const(hi)); let le = self.push_g(Op::Cmp(CmpKind::Le, val, hik)); self.push_g(Op::PanicIfZero(le, 4)); }
     fn emit_nonneg_check(&mut self, val: usize, ty: Option<ScalarTy>) {
         if ty.is_some_and(|t| t.is_unsigned() || t == ScalarTy::Bool) { return; }
-        let z = self.prog.push(Op::Const(0)); let ge = self.push_g(Op::Cmp(CmpKind::Ge, val, z)); self.push_g(Op::PanicIfZero(ge, 2));
-    }
+        let z = self.prog.push(Op::Const(0)); let ge = self.push_g(Op::Cmp(CmpKind::Ge, val, z)); self.push_g(Op::PanicIfZero(ge, 2)); }
     fn buf_index(&mut self, bb: BufBind, idx: usize) -> usize {
         let checked = if let Some(ln) = bb.len_node { self.push_g(Op::DynBoundsCheck(idx, ln)) }
             else if bb.base_const == 0 && bb.base_node.is_none() && self.prog.bufs.get(usize::from(bb.id)).is_some_and(|b| b.len == bb.len_const) { return idx; }
@@ -464,6 +513,50 @@ impl<'a> LowerCtx<'a> {
             else if bb.base_const > 0 { let off = self.prog.push(Op::Const(bb.base_const as i64)); self.push_g(Op::Add(checked, off)) } else { checked };
         if let Some(rl) = bb.root_len { if bb.len_node != Some(rl) { return self.push_g(Op::DynBoundsCheck(ri, rl)); } }
         ri
+    }
+    fn is_proven_cb(&self, bb: BufBind, idx: usize, len_n: usize, depth: u8) -> bool {
+        if self.utf8.str_ascii.contains(&bb.id) || idx == len_n || self.const_of(idx) == Some(0) || self.utf8.char_bounds.contains(&(bb.id, idx)) { return true; }
+        if let Some(k) = self.const_of(idx) { if self.utf8.starts_lens.contains(&(bb.id, k)) { return true; } }
+        if depth >= 3 { return false; }
+        match self.prog.nodes.get(idx).copied() {
+            Some(Op::Select { t_val, f_val, .. }) => self.is_proven_cb(bb, t_val, len_n, depth + 1) && self.is_proven_cb(bb, f_val, len_n, depth + 1),
+            Some(Op::Add(a, b)) => {
+                let (ka, kb) = (self.const_of(a), self.const_of(b));
+                (kb == Some(1) && self.utf8.ascii_at_idx.contains(&(bb.id, a)))
+                    || (ka == Some(1) && self.utf8.ascii_at_idx.contains(&(bb.id, b)))
+                    || kb.is_some_and(|k| self.utf8.find_lits.get(&(bb.id, a)) == Some(&k))
+                    || ka.is_some_and(|k| self.utf8.find_lits.get(&(bb.id, b)) == Some(&k))
+                    || self.utf8.find_dyn.get(&(bb.id, a)) == Some(&b)
+                    || self.utf8.find_dyn.get(&(bb.id, b)) == Some(&a)
+            }
+            Some(Op::Sub(a, b)) if a == len_n => self.const_of(b).is_some_and(|k| self.utf8.ends_lens.contains(&(bb.id, k))),
+            _ => false,
+        }
+    }
+    fn apply_utf8_guard(&mut self, cond: usize, pol: bool, depth: u8) {
+        if depth >= 4 { return; }
+        if pol {
+            if let Some(&bid) = self.utf8.ascii_preds.get(&cond) { self.utf8.str_ascii.insert(bid); }
+            if let Some(&(bid, ix)) = self.utf8.cb_preds.get(&cond) { self.utf8.char_bounds.insert((bid, ix)); }
+            if let Some(&(bid, k)) = self.utf8.starts_preds.get(&cond) { self.utf8.starts_lens.insert((bid, k)); }
+            if let Some(&(bid, k)) = self.utf8.ends_preds.get(&cond) { self.utf8.ends_lens.insert((bid, k)); }
+            if let Some(&(bid, ix)) = self.utf8.ascii_byte_preds.get(&cond) { self.utf8.char_bounds.insert((bid, ix)); self.utf8.ascii_at_idx.insert((bid, ix)); }
+        }
+        match self.prog.nodes.get(cond).copied() {
+            Some(Op::Cmp(CmpKind::Eq, x, y)) if self.const_of(y) == Some(0) => self.apply_utf8_guard(x, !pol, depth + 1),
+            Some(Op::Cmp(CmpKind::Eq, x, y)) if self.const_of(x) == Some(0) => self.apply_utf8_guard(y, !pol, depth + 1),
+            Some(Op::Select { cond: a, t_val: b, f_val }) if pol && self.const_of(f_val) == Some(0) => { self.apply_utf8_guard(a, true, depth + 1); self.apply_utf8_guard(b, true, depth + 1); }
+            Some(Op::Select { cond: a, t_val, f_val: b }) if !pol && self.const_of(t_val) == Some(1) => { self.apply_utf8_guard(a, false, depth + 1); self.apply_utf8_guard(b, false, depth + 1); }
+            Some(Op::Cmp(k, a, b)) if pol => {
+                let ascii_hit = match (self.utf8.byte_loads.get(&a).copied(), self.const_of(b), self.utf8.byte_loads.get(&b).copied(), self.const_of(a)) {
+                    (Some(p), Some(v), _, _) if (k == CmpKind::Eq && (0..128).contains(&v)) || (k == CmpKind::Lt && v <= 128) || (k == CmpKind::Le && v < 128) => Some(p),
+                    (_, _, Some(p), Some(v)) if (k == CmpKind::Eq && (0..128).contains(&v)) || (k == CmpKind::Gt && v <= 128) || (k == CmpKind::Ge && v < 128) => Some(p),
+                    _ => None,
+                };
+                if let Some((bid, ix)) = ascii_hit { self.utf8.char_bounds.insert((bid, ix)); self.utf8.ascii_at_idx.insert((bid, ix)); }
+            }
+            _ => {}
+        }
     }
     fn make_subslice(&mut self, bb: BufBind, lo: Option<(usize, Option<ScalarTy>)>, hi: Option<(usize, Option<ScalarTy>)>, inc: bool, checked_opt: bool, mutable: bool) -> Option<(Option<usize>, BufBind)> {
         if mutable && !bb.mutable { return None; }
@@ -476,7 +569,10 @@ impl<'a> LowerCtx<'a> {
             Some(ok)
         } else {
             self.emit_nonneg_check(a_id, a_ty); let (le1, le2) = (self.push_g(Op::Cmp(CmpKind::Le, a_id, b_id)), self.push_g(Op::Cmp(CmpKind::Le, b_id, len_n)));
-            self.push_g(Op::PanicIfZero(le1, 2)); self.push_g(Op::PanicIfZero(le2, 2)); None
+            self.push_g(Op::PanicIfZero(le1, 2)); self.push_g(Op::PanicIfZero(le2, 2));
+            if bb.is_str && (!self.is_proven_cb(bb, a_id, len_n, 0) || !self.is_proven_cb(bb, b_id, len_n, 0)) {
+                let z = self.prog.push(Op::Const(0)); self.push_g(Op::PanicIfZero(z, 5)); }
+            None
         }; let old_g = self.cur_guard; if let Some(ok) = ok_opt { self.cur_guard = self.and_guard(old_g, (ok, true)); }
         let (sub_bc, sub_bn, sub_lc, sub_ln) = match (self.const_of(a_id), self.const_of(b_id), bb.base_node, bb.len_node) {
             (Some(ac), Some(bc), None, None) if ac >= 0 && bc >= ac => (bb.base_const + ac as usize, None, (bc - ac) as usize, None),
@@ -488,7 +584,7 @@ impl<'a> LowerCtx<'a> {
                 (0, bn, bb.len_const, Some(self.push_g(Op::Sub(b_id, a_id))))
             }
         }; self.cur_guard = old_g;
-        Some((ok_opt, BufBind { id: bb.id, base_const: sub_bc, base_node: sub_bn, len_const: sub_lc, len_node: sub_ln, root_len: bb.root_len.or(bb.len_node), mutable, elem_ty: bb.elem_ty }))
+        Some((ok_opt, BufBind { id: bb.id, base_const: sub_bc, base_node: sub_bn, len_const: sub_lc, len_node: sub_ln, root_len: bb.root_len.or(bb.len_node), mutable, elem_ty: bb.elem_ty, is_str: bb.is_str }))
     }
     fn apply_binop(&mut self, op: &str, l: usize, lt: Option<ScalarTy>, r: usize, rt: Option<ScalarTy>) -> Option<Val> {
         let ty = lt.or(rt);
@@ -539,10 +635,8 @@ impl<'a> LowerCtx<'a> {
                 let old_g = self.cur_guard; self.cur_guard = self.and_guard(old_g, (l, op == "&&")); let rv = self.parse_binop(c, p + 1)?; let (r, _) = scalar_id(&rv)?; self.cur_guard = old_g;
                 let k = self.prog.push(Op::Const(i64::from(op == "||")));
                 let id = self.prog.push_guarded(if op == "&&" { Op::Select { cond: l, t_val: r, f_val: k } } else { Op::Select { cond: l, t_val: k, f_val: r } }, old_g);
-                lv = Val::Scalar(id, Some(ScalarTy::Bool)); continue;
-            }
-            let rv = self.parse_binop(c, p + 1)?; let (r, rt) = scalar_id(&rv)?; lv = self.apply_binop(op, l, lt, r, rt)?;
-        }
+                lv = Val::Scalar(id, Some(ScalarTy::Bool)); continue; }
+            let rv = self.parse_binop(c, p + 1)?; let (r, rt) = scalar_id(&rv)?; lv = self.apply_binop(op, l, lt, r, rt)?; }
         Some(lv)
     }
     fn parse_cast(&mut self, c: &mut Cursor<'_>) -> Option<Val> {
@@ -555,8 +649,7 @@ impl<'a> LowerCtx<'a> {
                 ScalarTy::Usize => if src_ty.is_some_and(|t| t.is_unsigned() || t == ScalarTy::Bool) { v } else { self.push_g(Op::BoundsCheck { idx: v, limit: (i64::MAX as usize).saturating_add(1) }) },
                 ScalarTy::I8 | ScalarTy::I16 | ScalarTy::I32 => if src_ty.is_some_and(|st| st.fits_in(dst)) { v } else { let s = (64 - dst.bits()) as u8; let sh = self.push_g(Op::Shl(v, s)); self.push_g(Op::Shr(sh, s)) },
                 ScalarTy::I64 | ScalarTy::Isize | ScalarTy::Bool => v,
-            }; val = Val::Scalar(nv, Some(dst));
-        }
+            }; val = Val::Scalar(nv, Some(dst)); }
         Some(val)
     }
     fn parse_unary(&mut self, c: &mut Cursor<'_>) -> Option<Val> {
@@ -564,20 +657,17 @@ impl<'a> LowerCtx<'a> {
             if let Some(&Tok::Int(v, ty)) = c.peek() { c.pos += 1; return Some(Val::Scalar(self.prog.push(Op::Const(v.checked_neg()?)), ty)); }
             let rv = self.parse_unary(c)?; let ((r, rty), z) = (scalar_id(&rv)?, self.prog.push(Op::Const(0))); let res = self.push_g(Op::Sub(z, r));
             if let Some(t) = rty.filter(|t| t.is_narrow() && !t.is_unsigned()) { self.emit_range_check(res, t); }
-            return Some(Val::Scalar(res, rty));
-        }
+            return Some(Val::Scalar(res, rty)); }
         if c.eat_sym("!") {
             let rv = self.parse_unary(c)?; let (r, rty) = scalar_id(&rv)?;
             if rty == Some(ScalarTy::Bool) || matches!(self.prog.nodes.get(r), Some(Op::Cmp(..))) {
-                let z = self.prog.push(Op::Const(0)); return Some(Val::Scalar(self.push_g(Op::Cmp(CmpKind::Eq, r, z)), Some(ScalarTy::Bool)));
-            }
+                let z = self.prog.push(Op::Const(0)); return Some(Val::Scalar(self.push_g(Op::Cmp(CmpKind::Eq, r, z)), Some(ScalarTy::Bool))); }
             let mk = self.prog.push(Op::Const(rty.filter(|t| t.is_narrow() && t.is_unsigned()).map_or(-1, |t| t.bounds().1))); return Some(Val::Scalar(self.push_g(Op::BitXor(r, mk)), rty));
         }
         if c.eat_sym("*") { return self.parse_unary(c); }
         if c.eat_sym("&") {
             let is_mut = c.eat_ident("mut");
-            return match self.parse_unary(c)? { Val::Buf(bb) => (!is_mut || bb.mutable).then_some(Val::Buf(BufBind { mutable: is_mut, ..bb })), other => Some(other) };
-        }
+            return match self.parse_unary(c)? { Val::Buf(bb) => (!is_mut || bb.mutable).then_some(Val::Buf(BufBind { mutable: is_mut, ..bb })), other => Some(other) }; }
         self.parse_postfix(c)
     }
     fn parse_array_lit(&mut self, c: &mut Cursor<'_>, elem_hint: Option<ScalarTy>) -> Option<Val> {
@@ -597,22 +687,21 @@ impl<'a> LowerCtx<'a> {
             let id = self.prog.add_buf(format!("__arr_{reg}"), elems.len(), true, reg, 0, ety.domain());
             for (k, &val) in elems.iter().enumerate() { let ki = self.prog.push(Op::Const(k as i64)); let st = self.push_g(Op::Store { buf: id, idx: ki, val }); self.stores.push(st); } id
         };
-        Some(Val::Buf(BufBind { id: bid, base_const: 0, base_node: None, len_const: elems.len(), len_node: None, root_len: None, mutable: true, elem_ty: ety }))
+        Some(Val::Buf(BufBind { id: bid, base_const: 0, base_node: None, len_const: elems.len(), len_node: None, root_len: None, mutable: true, elem_ty: ety, is_str: false }))
     }
     fn parse_struct_lit(&mut self, name: &str, c: &mut Cursor<'_>) -> Option<Val> {
         let (def, mut map, mut base_fs) = (self.file.structs.get(name)?, BTreeMap::new(), None);
         while !c.eat_sym("}") {
             if c.eat_sym("..") {
                 let Val::Struct(bn, bfs) = self.parse_expr(c)? else { return None; };
-                if bn != name { return None; } base_fs = Some(bfs); let _ = c.eat_sym(","); if !c.eat_sym("}") { return None; } break;
-            }
+                if bn != name { return None; } base_fs = Some(bfs); let _ = c.eat_sym(","); if !c.eat_sym("}") { return None; } break; }
             let fname = c.expect_ident()?; let val = if c.eat_sym(":") { self.parse_expr(c)? } else { self.vars.get(&fname)?.clone() }; map.insert(fname, val); let _ = c.eat_sym(",");
         }
         let mut ordered = Vec::with_capacity(def.fields.len());
         for (fname, fty) in &def.fields {
             let v = map.remove(fname).or_else(|| base_fs.as_ref()?.iter().find(|(k, _)| k == fname).map(|(_, v)| v.clone()))?;
-            ordered.push((fname.clone(), Val::Scalar(scalar_id(&v)?.0, Some(*fty))));
-        }
+            let fv = match fty { FieldTy::Scalar(st) => Val::Scalar(scalar_id(&v)?.0, Some(*st)), FieldTy::Slice(..) | FieldTy::Str => v, FieldTy::Opaque => Val::Opaque };
+            ordered.push((fname.clone(), fv)); }
         Some(Val::Struct(name.to_string(), ordered))
     }
     fn parse_range_or_idx(&mut self, c: &mut Cursor<'_>, end_sym: &str) -> Option<RangeOrIdx> {
@@ -627,8 +716,7 @@ impl<'a> LowerCtx<'a> {
         let (mut base_owned, mut sub) = (self.resolve_ty(&first).to_string(), c.expect_ident()?);
         while c.eat_sym("::") {
             if self.is_async && matches!(c.peek(), Some(Tok::Sym("<"))) { c.skip_angles(); break; }
-            base_owned.push_str("::"); base_owned.push_str(&sub); sub = c.expect_ident()?;
-        }
+            base_owned.push_str("::"); base_owned.push_str(&sub); sub = c.expect_ident()?; }
         let (is_opt, is_res) = (base_owned == "Option" || base_owned.ends_with("::Option"), base_owned == "Result" || base_owned.ends_with("::Result"));
         if c.eat_sym("(") {
             if let Some(st) = self.file.resolve_scalar(&base_owned) {
@@ -640,16 +728,12 @@ impl<'a> LowerCtx<'a> {
                     for k in 0..nbytes {
                         let ki = self.prog.push(Op::Const(k as i64)); let ri = self.buf_index(bb, ki); let b = self.push_g(Op::Load { buf: bb.id, idx: ri });
                         let sh = if be { ((nbytes - 1 - k) * 8) as u8 } else { (k * 8) as u8 }; let term = if sh == 0 { b } else { self.push_g(Op::Shl(b, sh)) };
-                        acc = Some(match acc { Some(a) => self.push_g(Op::BitOr(a, term)), None => term });
-                    }
-                    return Some(Val::Scalar(acc?, Some(st)));
-                }
-                return None;
-            }
+                        acc = Some(match acc { Some(a) => self.push_g(Op::BitOr(a, term)), None => term }); }
+                    return Some(Val::Scalar(acc?, Some(st))); }
+                return None; }
             if (is_opt && sub == "Some") || (is_res && sub == "Ok") { let v = self.parse_expr(c)?; if !c.eat_sym(")") { return None; } return Some(Val::Opt { is_some: self.prog.push(Op::Const(1)), payload: Box::new(v) }); }
             if is_res && sub == "Err" { return self.parse_err_ctor(c); }
-            return self.parse_call(&format!("{base_owned}::{sub}"), None, None, c);
-        }
+            return self.parse_call(&format!("{base_owned}::{sub}"), None, None, c); }
         if let Some(st) = self.file.resolve_scalar(&base_owned) { return Some(Val::Scalar(self.prog.push(Op::Const(st.assoc_const(&sub)?)), Some(st))); }
         if let Some(e) = self.file.enums.get(&base_owned) { return Some(Val::Scalar(self.prog.push(Op::Const(*e.variants.get(&sub)?)), Some(ScalarTy::Usize))); }
         if is_opt && sub == "None" { return Some(self.mk_none()); }
@@ -660,8 +744,7 @@ impl<'a> LowerCtx<'a> {
         let (start, mut d) = (c.pos, 1usize); while let Some(t) = c.next() { match t { Tok::Sym("(") => d += 1, Tok::Sym(")") => { d -= 1; if d == 0 { break; } } _ => {} } }
         let body = c.toks.get(start..c.pos.saturating_sub(1)).unwrap_or(&[]);
         if body.iter().any(|t| matches!(t, Tok::Sym("/" | "%" | "[" | "<<" | ">>" | "+" | "-" | "*")) || matches!(t, Tok::Ident(w) if w == "unwrap" || w == "expect")) {
-            let end = c.pos; c.pos = start; let _ = self.parse_expr(c)?; if c.pos + 1 != end { return None; } c.pos = end;
-        }
+            let end = c.pos; c.pos = start; let _ = self.parse_expr(c)?; if c.pos + 1 != end { return None; } c.pos = end; }
         Some(self.mk_none())
     }
     fn parse_scalar_method(&mut self, base: usize, ty: Option<ScalarTy>, m: &str, c: &mut Cursor<'_>) -> Option<Val> {
@@ -690,8 +773,7 @@ impl<'a> LowerCtx<'a> {
                     let ((lo, hi), raw) = (eff.bounds(), self.push_g(if is_add { Op::Add(base, r) } else { Op::Sub(base, r) }));
                     let (lok, hik) = (self.prog.push(Op::Const(lo)), self.prog.push(Op::Const(hi)));
                     let c1 = self.push_g(Op::Cmp(CmpKind::Lt, raw, lok)); let s1 = self.push_g(Op::Select { cond: c1, t_val: lok, f_val: raw });
-                    let c2 = self.push_g(Op::Cmp(CmpKind::Gt, s1, hik)); return Some(Val::Scalar(self.push_g(Op::Select { cond: c2, t_val: hik, f_val: s1 }), Some(eff)));
-                }
+                    let c2 = self.push_g(Op::Cmp(CmpKind::Gt, s1, hik)); return Some(Val::Scalar(self.push_g(Op::Select { cond: c2, t_val: hik, f_val: s1 }), Some(eff))); }
                 if !eff.is_unsigned() { return None; }
                 let old_g = self.cur_guard;
                 if is_add {
@@ -747,11 +829,16 @@ impl<'a> LowerCtx<'a> {
                 self.cur_guard = g_neg; let adj = self.push_g(Op::Select { cond: r_neg, t_val: sub_v, f_val: add_v });
                 self.cur_guard = old_g; Some(Val::Scalar(self.push_g(Op::Select { cond: neg_r, t_val: adj, f_val: rem }), ty))
             }
-            "is_ascii_digit" | "is_ascii_alphabetic" | "is_ascii_alphanumeric" | "is_ascii_whitespace" if args.is_empty() && ty == Some(ScalarTy::U8) => {
-                let rs: &[(i64, i64)] = match m { "is_ascii_digit" => &[(48, 57)], "is_ascii_alphabetic" => &[(65, 90), (97, 122)], "is_ascii_alphanumeric" => &[(48, 57), (65, 90), (97, 122)], _ => &[(9, 10), (12, 13), (32, 32)] };
-                let (one, mut acc) = (self.prog.push(Op::Const(1)), None);
+            "is_ascii" | "is_ascii_digit" | "is_ascii_alphabetic" | "is_ascii_alphanumeric" | "is_ascii_whitespace" | "is_ascii_hexdigit" if args.is_empty() && ty == Some(ScalarTy::U8) => {
+                let rs: &[(i64, i64)] = match m {
+                    "is_ascii" => &[(0, 127)], "is_ascii_digit" => &[(48, 57)], "is_ascii_alphabetic" => &[(65, 90), (97, 122)],
+                    "is_ascii_alphanumeric" => &[(48, 57), (65, 90), (97, 122)], "is_ascii_hexdigit" => &[(48, 57), (65, 70), (97, 102)],
+                    _ => &[(9, 10), (12, 13), (32, 32)],
+                }; let (one, mut acc) = (self.prog.push(Op::Const(1)), None);
                 for &(lo, hi) in rs { let in_r = self.in_bounds(base, lo, hi, true); acc = Some(match acc { Some(a) => self.push_g(Op::Select { cond: a, t_val: one, f_val: in_r }), None => in_r }); }
-                Some(Val::Scalar(acc?, Some(ScalarTy::Bool)))
+                let rid = acc?;
+                if let Some(&bl) = self.utf8.byte_loads.get(&base) { self.utf8.ascii_byte_preds.insert(rid, bl); }
+                Some(Val::Scalar(rid, Some(ScalarTy::Bool)))
             }
             _ if ty == Some(ScalarTy::Usize) => {
                 let st = self.self_ty.as_deref().filter(|s| self.file.enums.contains_key(*s))?;
@@ -798,7 +885,54 @@ impl<'a> LowerCtx<'a> {
                 let (_, rest) = self.make_subslice(bb, Some((one, Some(ScalarTy::Usize))), None, false, false, false)?; self.cur_guard = old_g;
                 Some(Val::Opt { is_some: ok, payload: Box::new(Val::Tuple(vec![Val::Scalar(ld, Some(bb.elem_ty)), Val::Buf(rest)])) })
             }
-            "as_slice" => c.eat_sym(")").then_some(Val::Buf(bb)), _ => None,
+            "as_slice" => c.eat_sym(")").then_some(Val::Buf(BufBind { is_str: false, ..bb })),
+            "as_bytes" => c.eat_sym(")").then_some(Val::Buf(BufBind { is_str: false, mutable: false, ..bb })),
+            "as_str" => c.eat_sym(")").then_some(Val::Buf(BufBind { is_str: true, mutable: false, ..bb })),
+            "is_ascii" => {
+                if !c.eat_sym(")") { return None; }
+                let p = self.prog.add_named_param("__is_ascii", Domain::range(0, 1)); self.utf8.ascii_preds.insert(p, bb.id);
+                Some(Val::Scalar(p, Some(ScalarTy::Bool)))
+            }
+            "is_char_boundary" => {
+                let idx = scalar_id(&self.parse_expr(c)?)?.0; if !c.eat_sym(")") { return None; }
+                let p = self.prog.add_named_param("__is_cb", Domain::range(0, 1)); self.utf8.cb_preds.insert(p, (bb.id, idx));
+                Some(Val::Scalar(p, Some(ScalarTy::Bool)))
+            }
+            "starts_with" | "ends_with" => {
+                let lit_len = match c.peek() { Some(&Tok::Str(l, true)) => { c.pos += 1; Some(l as i64) } _ => { let _ = self.parse_expr(c); None } };
+                if !c.eat_sym(")") { return None; }
+                let raw = self.prog.add_named_param("__str_affix", Domain::range(0, 1));
+                let p = if let Some(ll) = lit_len {
+                    let (ln, lk, z) = (self.buf_len_node(bb), self.prog.push(Op::Const(ll)), self.prog.push(Op::Const(0)));
+                    let ge = self.push_g(Op::Cmp(CmpKind::Ge, ln, lk)); let ok = self.push_g(Op::Select { cond: raw, t_val: ge, f_val: z });
+                    if m == "starts_with" { self.utf8.starts_preds.insert(ok, (bb.id, ll)); } else { self.utf8.ends_preds.insert(ok, (bb.id, ll)); }
+                    ok
+                } else { raw };
+                Some(Val::Scalar(p, Some(ScalarTy::Bool)))
+            }
+            "find" | "rfind" => {
+                let (mut lit_len, mut dyn_len) = (None, None);
+                match c.peek() {
+                    Some(&Tok::Str(l, true)) => { c.pos += 1; lit_len = Some(l as i64); }
+                    Some(Tok::Sym("@")) => { c.pos += 1; lit_len = Some(1); }
+                    Some(Tok::Ident(nv)) if matches!(c.peek_at(1), Some(Tok::Sym(")"))) => {
+                        if let Some(&Val::Buf(nb)) = self.vars.get(nv) { dyn_len = Some(self.buf_len_node(nb)); }
+                        c.pos += 1; }
+                    _ => { let mut d = 1usize; while let Some(t) = c.peek() { match t { Tok::Sym("(") => { d += 1; c.pos += 1; } Tok::Sym(")") => { d -= 1; if d == 0 { break; } c.pos += 1; } _ => c.pos += 1 } } }
+                }
+                if !c.eat_sym(")") { return None; }
+                let (ln, raw_ok, z) = (self.buf_len_node(bb), self.prog.add_named_param("__find_ok", Domain::range(0, 1)), self.prog.push(Op::Const(0)));
+                let pos = self.prog.add_named_param("__find_pos", Domain::range(0, MAX_SYM_SLICE_LEN as i64));
+                let lim = if let Some(ll) = lit_len {
+                    let lk = self.prog.push(Op::Const(ll)); let end = self.push_g(Op::Add(pos, lk)); self.utf8.find_lits.insert((bb.id, pos), ll); self.push_g(Op::Cmp(CmpKind::Le, end, ln))
+                } else if let Some(nl) = dyn_len {
+                    let end = self.push_g(Op::Add(pos, nl)); self.utf8.find_dyn.insert((bb.id, pos), nl); self.push_g(Op::Cmp(CmpKind::Le, end, ln))
+                } else { self.push_g(Op::Cmp(CmpKind::Le, pos, ln)) };
+                let ok = self.push_g(Op::Select { cond: raw_ok, t_val: lim, f_val: z }); self.utf8.char_bounds.insert((bb.id, pos));
+                Some(Val::Opt { is_some: ok, payload: Box::new(Val::Scalar(pos, Some(ScalarTy::Usize))) })
+            }
+            "trim" | "trim_start" | "trim_end" => c.eat_sym(")").then_some(Val::Buf(bb)),
+            _ => None,
         }
     }
     fn parse_opt_method(&mut self, is_some: usize, payload: Val, m: &str, c: &mut Cursor<'_>) -> Option<Val> {
@@ -832,13 +966,11 @@ impl<'a> LowerCtx<'a> {
         let hv = self.prog.add_named_param("__havoc_buf", bb.elem_ty.domain());
         if bb.len_node.is_none() && bb.len_const <= 64 {
             for k in 0..bb.len_const { let ki = self.prog.push(Op::Const(k as i64)); let ri = self.buf_index(bb, ki); let st = self.push_g(Op::Store { buf: bb.id, idx: ri, val: hv }); self.stores.push(st); }
-            return;
-        }
+            return; }
         if let (Some(ln), Some(rlen)) = (bb.len_node, self.prog.bufs.get(usize::from(bb.id)).map(|b| b.len).filter(|&l| l <= 64)) {
             let lo = bb.base_node.unwrap_or_else(|| self.prog.push(Op::Const(bb.base_const as i64))); let hi = self.push_g(Op::Add(lo, ln));
             for k in 0..rlen { let ki = self.prog.push(Op::Const(k as i64)); self.store_guarded(bb.id, ki, hv, lo, hi); }
-            return;
-        }
+            return; }
         let mut seen = Vec::new();
         for &op in &self.prog.nodes { if let Op::Store { buf, idx, .. } = op { if buf == bb.id && !seen.contains(&idx) { seen.push(idx); if seen.len() >= 8 { break; } } } }
         let (rln, z) = (bb.root_len.or(bb.len_node).unwrap_or_else(|| self.prog.push(Op::Const(bb.len_const as i64))), self.prog.push(Op::Const(0)));
@@ -861,8 +993,7 @@ impl<'a> LowerCtx<'a> {
                     if let Some(f) = fld {
                         if let Val::Struct(sn, mut fs) = cur { if let Some((_, fv)) = fs.iter_mut().find(|(k, _)| k == f) { *fv = self.havoc_val(fv); } self.vars.insert(vname.clone(), Val::Struct(sn, fs)); }
                     } else { if let Val::Buf(bb) = cur { done_bufs.insert(bb.id); } let hv = self.havoc_val(&cur); self.vars.insert(vname.clone(), hv); }
-                    continue;
-                }
+                    continue; }
             }
             if let Val::Buf(bb) = arg { if bb.mutable && done_bufs.insert(bb.id) { self.havoc_buf(*bb); } }
         }
@@ -871,7 +1002,12 @@ impl<'a> LowerCtx<'a> {
         let mut base_var: Option<String> = None;
         let mut base = match c.peek()? {
             &Tok::Int(v, ty) => { c.pos += 1; Val::Scalar(self.prog.push(Op::Const(v)), ty) }
-            Tok::Sym("\"") if self.is_async => { c.pos += 1; Val::Opaque }
+            &Tok::Str(slen, is_ascii) => {
+                c.pos += 1;
+                let reg = self.alloc_region(); let bid = self.prog.add_buf(format!("__str_{reg}"), slen.max(1), false, reg, 0, Domain::range(0, if is_ascii { 127 } else { 255 }));
+                if is_ascii { self.utf8.str_ascii.insert(bid); }
+                Val::Buf(BufBind { id: bid, base_const: 0, base_node: None, len_const: slen, len_node: None, root_len: None, mutable: false, elem_ty: ScalarTy::U8, is_str: true })
+            }
             Tok::Sym("(") => {
                 c.pos += 1;
                 if c.eat_sym(")") { Val::Tuple(Vec::new()) } else {
@@ -913,7 +1049,11 @@ impl<'a> LowerCtx<'a> {
             if c.eat_sym("[") {
                 base_var = None; let Val::Buf(bb) = base else { return None; };
                 base = match self.parse_range_or_idx(c, "]")? {
-                    Ok((idx, _)) => { let ri = self.buf_index(bb, idx); Val::Scalar(self.push_g(Op::Load { buf: bb.id, idx: ri }), Some(bb.elem_ty)) }
+                    Ok((idx, _)) => {
+                        let ri = self.buf_index(bb, idx); let ld = self.push_g(Op::Load { buf: bb.id, idx: ri });
+                        if bb.elem_ty == ScalarTy::U8 { self.utf8.byte_loads.insert(ld, (bb.id, idx)); }
+                        Val::Scalar(ld, Some(bb.elem_ty))
+                    }
                     Err((lo, hi, inc)) => Val::Buf(self.make_subslice(bb, lo, hi, inc, false, bb.mutable)?.1),
                 };
             } else if c.eat_sym(".") {
@@ -923,10 +1063,8 @@ impl<'a> LowerCtx<'a> {
                     if matches!(base, Val::Opaque) {
                         let opt_next = matches!(c.peek(), Some(Tok::Sym("?"))) || (matches!(c.peek(), Some(Tok::Sym("."))) && matches!(c.peek_at(1), Some(Tok::Ident(w)) if matches!(w.as_str(), "unwrap" | "expect" | "unwrap_or" | "unwrap_or_default" | "is_ok" | "is_err" | "is_some" | "is_none" | "ok_or" | "copied" | "cloned")));
                         base = if opt_next { Val::Opt { is_some: self.prog.add_named_param("__await_ok", Domain::range(0, 1)), payload: Box::new(Val::Scalar(self.prog.add_named_param("__await_val", Domain::range(0, MAX_SYM_SLICE_LEN as i64)), None)) } }
-                            else { Val::Scalar(self.prog.add_named_param("__await_val", Domain::top()), None) };
-                    }
-                    continue;
-                }
+                            else { Val::Scalar(self.prog.add_named_param("__await_val", Domain::top()), None) }; }
+                    continue; }
                 let m = c.expect_ident()?;
                 if c.eat_sym("(") {
                     let (arg_pos, recv_t, saved) = (c.pos, base_var.take().map(|n| (n, None)), self.is_async.then(|| (self.prog.clone(), self.stores.len(), self.next_region, self.inlined_fns.clone())));
@@ -967,8 +1105,7 @@ impl<'a> LowerCtx<'a> {
                 if let Some(v) = self.inline_call(name, &args, &targets) { return Some(v); }
                 if self.is_async && (recv_opaque || Self::is_await_next(c)) {
                     if let Some((sp, sl, nr, inf)) = saved { (self.prog, self.next_region, *self.inlined_fns) = (sp, nr, inf); self.stores.truncate(sl); }
-                    self.havoc_mut_args(&targets, &args); return Some(Val::Opaque);
-                }
+                    self.havoc_mut_args(&targets, &args); return Some(Val::Opaque); }
                 None
             }
         }
@@ -992,16 +1129,14 @@ impl<'a> LowerCtx<'a> {
             while matches!(cc.peek(), Some(Tok::Sym("#"))) { let _ = cc.parse_attr(&mut dm); }
             let (is_ref_self, is_mut_self) = (cc.eat_sym("&"), cc.eat_ident("mut"));
             if cc.eat_ident("self") {
-                if is_ref_self && is_mut_self { if !(self.is_async || item.is_async) { return None; } mut_params.push((ai, "self".to_string())); cmr.insert("self".to_string()); }
-                nv.insert("self".to_string(), args.get(ai)?.clone()); ai += 1; let _ = cc.eat_sym(","); continue;
-            }
+                if is_ref_self && is_mut_self { mut_params.push((ai, "self".to_string())); cmr.insert("self".to_string()); }
+                nv.insert("self".to_string(), args.get(ai)?.clone()); ai += 1; let _ = cc.eat_sym(","); continue; }
             if is_ref_self { return None; }
             let pname = cc.expect_ident()?; if !cc.eat_sym(":") { return None; }
             if matches!(cc.peek(), Some(Tok::Sym("&"))) && matches!(cc.peek_at(1), Some(Tok::Ident(w)) if w == "mut") {
                 cmr.insert(pname.clone()); if !matches!(cc.peek_at(2), Some(Tok::Sym("["))) { mut_params.push((ai, pname.clone())); }
             }
-            cc.skip_until(",", ")", true); nv.insert(pname, args.get(ai)?.clone()); ai += 1; let _ = cc.eat_sym(",");
-        }
+            cc.skip_until(",", ")", true); nv.insert(pname, args.get(ai)?.clone()); ai += 1; let _ = cc.eat_sym(","); }
         if ai != args.len() { return None; }
         let mut callee_ret_opt = false;
         if cc.eat_sym("->") {
@@ -1015,13 +1150,14 @@ impl<'a> LowerCtx<'a> {
                 }
             }
         } else if cc.eat_ident("where") { cc.skip_until("{", ";", false); }
-        let (sv, se, sg, sst, sro, sa, smr) = (
+        let (sv, se, sg, sst, sro, sa, smr, sld, sil) = (
             std::mem::replace(&mut self.vars, nv), std::mem::take(&mut self.early_rets), self.cur_guard,
             std::mem::replace(&mut self.self_ty, item.self_ty.clone()), std::mem::replace(&mut self.returns_opt, callee_ret_opt),
             std::mem::replace(&mut self.is_async, item.is_async), std::mem::replace(&mut self.mut_refs, cmr),
+            std::mem::replace(&mut self.loop_depth, 0), std::mem::replace(&mut self.in_loop, false),
         ); self.depth += 1; let res = self.parse_block(&mut cc); self.depth -= 1;
         let (callee_vars, callee_early) = (std::mem::replace(&mut self.vars, sv), std::mem::replace(&mut self.early_rets, se));
-        (self.cur_guard, self.self_ty, self.returns_opt, self.is_async, self.mut_refs) = (sg, sst, sro, sa, smr); let (rets, tail, _) = res?;
+        (self.cur_guard, self.self_ty, self.returns_opt, self.is_async, self.mut_refs, self.loop_depth, self.in_loop) = (sg, sst, sro, sa, smr, sld, sil); let (rets, tail, _) = res?;
         if !mut_params.is_empty() {
             if !callee_early.is_empty() { return None; }
             for (arg_idx, pname) in mut_params {
@@ -1037,8 +1173,7 @@ impl<'a> LowerCtx<'a> {
         if c.eat_sym("(") {
             let Val::Tuple(xs) = val else { return None; }; let mut i = 0usize;
             while !c.eat_sym(")") { let _ = c.eat_ident("mut"); let v = xs.get(i)?.clone(); i += 1; self.bind_pat(c, v)?; let _ = c.eat_sym(","); }
-            return (i == xs.len()).then_some(());
-        }
+            return (i == xs.len()).then_some(()); }
         let _ = c.eat_ident("mut"); let name = c.expect_ident()?;
         if name != "_" { self.vars.insert(name, val); } Some(())
     }
@@ -1060,18 +1195,19 @@ impl<'a> LowerCtx<'a> {
             if matches!(self.toks.get(pat_pos), Some(Tok::Sym("("))) { (is_some, Some((pat_pos, *payload)), None) }
             else { let mut pc = Cursor { toks: self.toks, pos: pat_pos }; let (mc, mb) = self.match_opt_inner(is_some, &payload, &mut pc)?; (mc, None, mb) }
         } else { let cv = self.parse_expr_head(c)?; (scalar_id(&cv)?.0, None, None) }; self.cur_guard = self.and_guard(old_g, (cond, true));
+        let u_cond = self.utf8.clone(); self.apply_utf8_guard(cond, true, 0);
         if let Some((pat_pos, payload)) = opt_bind { let mut pc = Cursor { toks: self.toks, pos: pat_pos }; self.bind_pat(&mut pc, payload)?; }
         if let Some((k, v)) = opt_var { self.vars.insert(k, v); }
-        let (_, t_tail, t_ret) = self.parse_block(c)?; let vars_t = std::mem::replace(&mut self.vars, vars0.clone());
+        let (_, t_tail, t_ret) = self.parse_block(c)?; let vars_t = std::mem::replace(&mut self.vars, vars0.clone()); self.utf8 = u_cond.clone();
         let (f_tail, f_ret, vars_f) = if c.eat_ident("else") {
-            self.cur_guard = self.and_guard(old_g, (cond, false)); let res = if c.eat_ident("if") { self.parse_if(c)? } else { let (_, t, r) = self.parse_block(c)?; (t, r) };
+            self.cur_guard = self.and_guard(old_g, (cond, false)); self.apply_utf8_guard(cond, false, 0);
+            let res = if c.eat_ident("if") { self.parse_if(c)? } else { let (_, t, r) = self.parse_block(c)?; (t, r) };
             (res.0, res.1, std::mem::replace(&mut self.vars, vars0.clone()))
-        } else { (None, false, vars0.clone()) }; self.cur_guard = old_g;
+        } else { (None, false, vars0.clone()) }; self.cur_guard = old_g; self.utf8 = u_cond;
         for (k, v0) in vars0 {
             let (vt, vf) = (vars_t.get(&k).cloned().unwrap_or_else(|| v0.clone()), vars_f.get(&k).cloned().unwrap_or(v0));
-            let mv = if t_ret && !f_ret { vf } else if f_ret && !t_ret { vt } else { self.merge_val(cond, vt, vf, old_g)? }; self.vars.insert(k, mv);
-        }
-        if t_ret ^ f_ret { self.cur_guard = self.and_guard(old_g, (cond, f_ret)); }
+            let mv = if t_ret && !f_ret { vf } else if f_ret && !t_ret { vt } else { self.merge_val(cond, vt, vf, old_g)? }; self.vars.insert(k, mv); }
+        if t_ret ^ f_ret { self.cur_guard = self.and_guard(old_g, (cond, f_ret)); self.apply_utf8_guard(cond, f_ret, 0); }
         let val = match (t_tail, f_tail, t_ret, f_ret) {
             (Some(tt), Some(ft), false, false) => Some(self.merge_val(cond, tt, ft, old_g)?),
             (Some(tt), _, false, true) => Some(tt), (_, Some(ft), true, false) => Some(ft), _ => None,
@@ -1117,8 +1253,7 @@ impl<'a> LowerCtx<'a> {
         }
         if c.eat_ident("if") {
             let (gc, _) = scalar_id(&self.parse_expr_head(c)?)?;
-            cond = Some(match cond { Some(a) => { let z = self.prog.push(Op::Const(0)); self.push_g(Op::Select { cond: a, t_val: gc, f_val: z }) } None => gc });
-        }
+            cond = Some(match cond { Some(a) => { let z = self.prog.push(Op::Const(0)); self.push_g(Op::Select { cond: a, t_val: gc, f_val: z }) } None => gc }); }
         Some((cond, bind))
     }
     fn parse_match(&mut self, c: &mut Cursor<'_>) -> Option<(Option<Val>, bool)> {
@@ -1197,6 +1332,103 @@ impl<'a> LowerCtx<'a> {
     fn parse_compound_rhs(&mut self, op: &str, old: usize, old_ty: Option<ScalarTy>, r: usize, r_ty: Option<ScalarTy>) -> Option<Val> {
         if op == "=" { Some(Val::Scalar(r, old_ty.or(r_ty))) } else { self.apply_binop(op.strip_suffix('=')?, old, old_ty, r, r_ty) }
     }
+    fn scan_loop_mutations(toks: &[Tok], start: usize) -> Option<(LoopMutMap, bool)> {
+        if !matches!(toks.get(start), Some(Tok::Sym("{"))) { return None; }
+        let (mut i, mut d, mut muts, mut has_break) = (start + 1, 1usize, LoopMutMap::new(), false);
+        while i < toks.len() && d > 0 {
+            match toks.get(i) {
+                Some(Tok::Sym("{")) => d += 1, Some(Tok::Sym("}")) => { d -= 1; if d == 0 { break; } }
+                Some(Tok::Ident(w)) if w == "break" => {
+                    has_break = true;
+                    if !matches!(toks.get(i + 1), Some(Tok::Sym(";" | "}"))) { return None; }
+                }
+                Some(Tok::Ident(nm)) => {
+                    let prev_dot = i > start + 1 && matches!(toks.get(i - 1), Some(Tok::Sym(".")));
+                    if !prev_dot && matches!(toks.get(i + 1), Some(Tok::Sym("."))) {
+                        if let (Some(Tok::Ident(f)), Some(Tok::Sym(op))) = (toks.get(i + 2), toks.get(i + 3)) {
+                            let bit = match *op { "+=" => 1u8, "-=" => 2u8, "=" | "*=" | "/=" | "%=" | "&=" | "|=" | "^=" => 4u8, _ => 0 };
+                            if bit != 0 { *muts.entry((nm.clone(), Some(f.clone()))).or_insert(0) |= bit; }
+                        }
+                    } else if !prev_dot {
+                        if let Some(Tok::Sym(op)) = toks.get(i + 1) {
+                            let bit = match *op { "+=" => 1u8, "-=" => 2u8, "=" | "*=" | "/=" | "%=" | "&=" | "|=" | "^=" => 4u8, _ => 0 };
+                            if bit != 0 { *muts.entry((nm.clone(), None)).or_insert(0) |= bit; }
+                        }
+                    }
+                }
+                _ => {}
+            }
+            i += 1; }
+        Some((muts, has_break))
+    }
+    fn havoc_loop_vars(&mut self, muts: &LoopMutMap, pre: &LoopPreMap, len_vars: &BTreeSet<String>, sq_doms: &BTreeMap<String, Domain>) -> Option<()> {
+        for (key, &bits) in muts {
+            let Some(&(pre_id, ty)) = pre.get(key) else { continue; };
+            let (dom, eff_ty) = if let Some(&sd) = key.1.is_none().then(|| sq_doms.get(&key.0)).flatten() { (sd, ty) }
+                else if key.1.is_none() && ty.is_none() && len_vars.contains(&key.0) { (Domain::range(0, MAX_SYM_SLICE_LEN as i64), Some(ScalarTy::Usize)) }
+                else { (match ty { Some(ScalarTy::Usize) => Domain::range(0, MAX_SYM_SLICE_LEN as i64), Some(t) => t.domain(), None => Domain::top() }, ty) };
+            let hv = self.prog.add_named_param("__loop_var", dom);
+            if bits == 1 { let ge = self.push_g(Op::Cmp(CmpKind::Ge, hv, pre_id)); self.cur_guard = self.and_guard(self.cur_guard, (ge, true)); }
+            else if bits == 2 { let le = self.push_g(Op::Cmp(CmpKind::Le, hv, pre_id)); self.cur_guard = self.and_guard(self.cur_guard, (le, true)); }
+            self.write_mut_target(&key.0, key.1.as_deref(), Val::Scalar(hv, eff_ty)); }
+        Some(())
+    }
+    fn parse_while_or_loop(&mut self, c: &mut Cursor<'_>, is_while: bool) -> Option<()> {
+        if !is_while || self.prog.check_reg_budget || self.loop_depth >= 2 { return None; }
+        let cond_pos = c.pos; let mut d = 0usize;
+        while let Some(t) = c.peek() {
+            match t { Tok::Sym("{") if d == 0 => break, Tok::Sym("(" | "[") => { d += 1; c.pos += 1; } Tok::Sym(")" | "]") => { d = d.saturating_sub(1); c.pos += 1; } _ => c.pos += 1 }
+        }
+        let body_pos = c.pos; let (muts, has_break) = Self::scan_loop_mutations(self.toks, body_pos)?; let mut pre = BTreeMap::new();
+        for key in muts.keys() {
+            let val = match (&key.1, self.vars.get(&key.0)) {
+                (None, Some(v)) => Some(v),
+                (Some(f), Some(Val::Struct(_, fs))) => fs.iter().find(|(k, _)| k == f).map(|(_, v)| v),
+                _ => None,
+            };
+            if let Some(v) = val { if let Some(s) = scalar_id(v) { pre.insert(key.clone(), s); } }
+        }
+        let cond_toks = self.toks.get(cond_pos..body_pos).unwrap_or(&[]); let (mut len_vars, mut sq_doms) = (BTreeSet::new(), BTreeMap::new());
+        if cond_toks.iter().any(|t| matches!(t, Tok::Ident(w) if w == "len")) {
+            for (k, &(pid, ty)) in &pre {
+                if k.1.is_none() && ty.is_none() && self.const_of(pid).is_some_and(|v| v >= 0) && cond_toks.iter().any(|t| matches!(t, Tok::Ident(w) if w == &k.0)) { len_vars.insert(k.0.clone()); }
+            }
+        }
+        if let [Tok::Ident(dv_n), Tok::Sym("*"), Tok::Ident(d2), Tok::Sym("<=" | "<"), Tok::Ident(vn)] = cond_toks {
+            if dv_n == d2 && muts.get(&(dv_n.clone(), None)) == Some(&1) && !muts.contains_key(&(vn.clone(), None)) {
+                if let (Some(&(pre_d, dty)), Some((v_id, _))) = (pre.get(&(dv_n.clone(), None)), self.vars.get(vn).and_then(scalar_id)) {
+                    let (mut step, mut ok, mut bi, mut bd) = (0i64, true, body_pos.saturating_add(1), 1usize);
+                    while let Some(t) = self.toks.get(bi) {
+                        match t {
+                            Tok::Sym("{") => bd = bd.saturating_add(1), Tok::Sym("}") => { bd = bd.saturating_sub(1); if bd == 0 { break; } }
+                            Tok::Ident(nm) if nm == dv_n && matches!(self.toks.get(bi.saturating_add(1)), Some(Tok::Sym("+="))) => {
+                                if let Some(&Tok::Int(k, _)) = self.toks.get(bi.saturating_add(2)) { if k > 0 { step = step.saturating_add(k); } else { ok = false; } } else { ok = false; }
+                            }
+                            _ => {}
+                        }
+                        bi = bi.saturating_add(1); }
+                    if ok && step > 0 {
+                        let doms = self.prog.infer_domains(&self.prog.param_domains);
+                        let (dv, dd) = (doms.get(v_id).copied().unwrap_or_else(Domain::top), doms.get(pre_d).copied().unwrap_or_else(Domain::top));
+                        if dv.lo >= 0 && dv.hi >= 0 && dv.hi <= i64::MAX / 4 && dd.lo >= 0 {
+                            let mut hi = (dv.hi as f64).sqrt() as i64; while (hi.saturating_add(1)).saturating_mul(hi.saturating_add(1)) <= dv.hi { hi = hi.saturating_add(1); } while hi.saturating_mul(hi) > dv.hi { hi = hi.saturating_sub(1); } let hi = hi.saturating_add(step);
+                            if dd.hi <= hi && match dty { None => true, Some(t) => hi <= t.bounds().1 } { sq_doms.insert(dv_n.clone(), Domain::range(dd.lo, hi)); }
+                        }
+                    }
+                }
+            }
+        }
+        let (old_g, old_u, old_in) = (self.cur_guard, self.utf8.clone(), self.in_loop); self.havoc_loop_vars(&muts, &pre, &len_vars, &sq_doms)?;
+        {
+            let mut cc = Cursor { toks: self.toks, pos: cond_pos }; let cond = scalar_id(&self.parse_expr_head(&mut cc)?)?.0;
+            self.cur_guard = self.and_guard(self.cur_guard, (cond, true)); self.apply_utf8_guard(cond, true, 0); }
+        self.loop_depth += 1; self.in_loop = true; c.pos = body_pos; let res = self.parse_block(c);
+        self.loop_depth -= 1; self.in_loop = old_in; let _ = res?; self.cur_guard = old_g; self.utf8 = old_u; self.havoc_loop_vars(&muts, &pre, &len_vars, &sq_doms)?;
+        if is_while && !has_break {
+            let mut cc = Cursor { toks: self.toks, pos: cond_pos }; let cond_post = scalar_id(&self.parse_expr_head(&mut cc)?)?.0;
+            self.cur_guard = self.and_guard(self.cur_guard, (cond_post, false)); self.apply_utf8_guard(cond_post, false, 0); }
+        Some(())
+    }
     fn parse_block(&mut self, c: &mut Cursor<'_>) -> Option<(Vec<Val>, Option<Val>, bool)> {
         if !c.eat_sym("{") { return None; }
         let (mut rets, mut tail, mut returned) = (Vec::new(), None, false);
@@ -1209,8 +1441,7 @@ impl<'a> LowerCtx<'a> {
                 let mut val = if matches!(c.peek(), Some(Tok::Sym("["))) { c.pos += 1; self.parse_array_lit(c, hint)? } else { self.parse_expr(c)? };
                 if let (Val::Scalar(id, None), Some(ht)) = (&val, hint) {
                     if self.is_async { if let Some(&Op::Param(p)) = self.prog.nodes.get(*id) { if let Some(s) = self.prog.param_domains.get_mut(usize::from(p)) { *s = ht.domain(); } } }
-                    val = Val::Scalar(*id, Some(ht));
-                }
+                    val = Val::Scalar(*id, Some(ht)); }
                 if !c.eat_sym(";") { return None; }
                 let mut pc = Cursor { toks: self.toks, pos: pat_pos }; self.bind_pat(&mut pc, val)?;
             } else if matches!(c.peek(), Some(Tok::Ident(w)) if matches!(w.as_str(), "assert" | "debug_assert" | "assert_eq" | "debug_assert_eq" | "assert_ne" | "debug_assert_ne")) {
@@ -1220,7 +1451,11 @@ impl<'a> LowerCtx<'a> {
                 if all_ret { returned = true; }
                 if !c.eat_sym(";") && matches!(c.peek(), Some(Tok::Sym("}"))) { if let Some(v) = val { tail = Some(v.clone()); rets.push(v); } }
             } else if c.eat_ident("for") { self.parse_for_loop(c)?; }
-            else if c.eat_ident("return") {
+            else if c.eat_ident("while") { self.parse_while_or_loop(c, true)?; }
+            else if c.eat_ident("loop") { self.parse_while_or_loop(c, false)?; }
+            else if self.in_loop && (c.eat_ident("break") || c.eat_ident("continue")) {
+                returned = true; let _ = c.eat_sym(";");
+            } else if c.eat_ident("return") {
                 returned = true; if !c.eat_sym(";") { let rv = self.parse_expr(c)?; let _ = c.eat_sym(";"); self.record_return(rv.clone()); rets.push(rv); }
             } else if matches!(c.peek(), Some(Tok::Ident(nm)) if matches!(self.vars.get(nm), Some(Val::Buf(_)))) && self.looks_like_store(c) {
                 let nm = c.expect_ident()?; let Some(&Val::Buf(bb)) = self.vars.get(&nm) else { return None; }; if !bb.mutable || !c.eat_sym("[") { return None; }
@@ -1245,19 +1480,53 @@ impl<'a> LowerCtx<'a> {
                 self.vars.insert(nm, nv);
             } else {
                 let v = self.parse_expr(c)?; if c.eat_sym(";") { continue; }
-                tail = Some(v.clone()); rets.push(v); return c.eat_sym("}").then_some((rets, tail, returned));
-            }
+                tail = Some(v.clone()); rets.push(v); return c.eat_sym("}").then_some((rets, tail, returned)); }
         }
         Some((rets, tail, returned))
     }
 }
-fn add_struct_params(ctx: &mut LowerCtx<'_>, prefix: &str, tname: &str) -> Option<(Val, StructFields)> {
-    let def = ctx.file.structs.get(tname)?; let (mut fs, mut pfs) = (Vec::with_capacity(def.fields.len()), Vec::with_capacity(def.fields.len()));
+fn add_struct_params(ctx: &mut LowerCtx<'_>, prefix: &str, tname: &str, mutable: bool) -> Option<(Val, StructFields)> {
+    let def = ctx.file.structs.get(tname)?; let has_buf = def.fields.iter().any(|(_, t)| matches!(t, FieldTy::Slice(_, _) | FieldTy::Str));
+    let has_opaque = def.fields.iter().any(|(_, t)| matches!(t, FieldTy::Opaque)); let has_non_scalar = def.fields.iter().any(|(_, t)| !matches!(t, FieldTy::Scalar(_)));
+    if ctx.prog.check_reg_budget && (mutable || has_non_scalar) && !ctx.is_async { return None; }
+    if (mutable || has_opaque) && !has_buf && !ctx.is_async { return None; }
+    let (mut fs, mut pfs, mut buf_lens, mut usize_pids) = (Vec::with_capacity(def.fields.len()), Vec::with_capacity(def.fields.len()), Vec::new(), Vec::new());
     for (fname, fty) in &def.fields {
-        let pidx = ctx.prog.param_domains.len(); let pid = ctx.prog.add_named_param(format!("{prefix}_{fname}"), fty.domain());
-        fs.push((fname.clone(), Val::Scalar(pid, Some(*fty)))); pfs.push((fname.clone(), *fty, pidx));
+        let full = format!("{prefix}_{fname}");
+        let v = match *fty {
+            FieldTy::Scalar(st) => {
+                let dom = if has_buf && st == ScalarTy::Usize { Domain::range(0, MAX_SYM_SLICE_LEN as i64) } else { st.domain() };
+                let pidx = ctx.prog.param_domains.len(); let pid = ctx.prog.add_named_param(&full, dom);
+                if st == ScalarTy::Usize { usize_pids.push(pid); }
+                pfs.push((fname.clone(), st, pidx)); Val::Scalar(pid, Some(st))
+            }
+            FieldTy::Slice(ety, mut_b) => {
+                ctx.has_opaque = true; let reg = ctx.alloc_region();
+                let len_pid = ctx.prog.add_named_param(format!("slice_len:{full}:{}", ety.as_str()), Domain::range(0, MAX_SYM_SLICE_LEN as i64));
+                buf_lens.push(len_pid); let bid = ctx.prog.add_buf(&full, MAX_SYM_SLICE_LEN, mut_b, reg, 0, ety.domain());
+                Val::Buf(BufBind { id: bid, base_const: 0, base_node: None, len_const: MAX_SYM_SLICE_LEN, len_node: Some(len_pid), root_len: Some(len_pid), mutable: mut_b, elem_ty: ety, is_str: false })
+            }
+            FieldTy::Str => {
+                ctx.has_opaque = true; let reg = ctx.alloc_region();
+                let len_pid = ctx.prog.add_named_param(format!("str_len:{full}"), Domain::range(0, MAX_SYM_SLICE_LEN as i64));
+                buf_lens.push(len_pid); let bid = ctx.prog.add_buf(&full, MAX_SYM_SLICE_LEN, false, reg, 0, ScalarTy::U8.domain());
+                Val::Buf(BufBind { id: bid, base_const: 0, base_node: None, len_const: MAX_SYM_SLICE_LEN, len_node: Some(len_pid), root_len: Some(len_pid), mutable: false, elem_ty: ScalarTy::U8, is_str: true })
+            }
+            FieldTy::Opaque => { ctx.has_opaque = true; Val::Opaque }
+        }; fs.push((fname.clone(), v)); }
+    if buf_lens.len() == 1 {
+        let bl = buf_lens[0];
+        for pid in usize_pids { let le = ctx.push_g(Op::Cmp(CmpKind::Le, pid, bl)); ctx.cur_guard = ctx.and_guard(ctx.cur_guard, (le, true)); }
     }
     Some((Val::Struct(tname.to_string(), fs), pfs))
+}
+fn add_str_param(ctx: &mut LowerCtx<'_>, pname: String, poc_name: String, ov: Option<Domain>, reg_ov: Option<(u16, usize)>, owned: bool) -> Option<()> {
+    if ctx.prog.check_reg_budget { return None; }
+    let (region, offset) = reg_ov.unwrap_or_else(|| (ctx.alloc_region(), 0)); let pidx = ctx.prog.param_domains.len();
+    let len_pid = ctx.prog.add_named_param(format!("str_len:{pname}"), ov.unwrap_or_else(|| Domain::range(0, MAX_SYM_SLICE_LEN as i64)));
+    let bid = ctx.prog.add_buf(&pname, MAX_SYM_SLICE_LEN, false, region, offset, ScalarTy::U8.domain()); ctx.poc_params.push(PocParam::Str { name: poc_name, pidx, owned });
+    ctx.vars.insert(pname, Val::Buf(BufBind { id: bid, base_const: 0, base_node: None, len_const: MAX_SYM_SLICE_LEN, len_node: Some(len_pid), root_len: Some(len_pid), mutable: false, elem_ty: ScalarTy::U8, is_str: true }));
+    Some(())
 }
 fn push_scalar_param(ctx: &mut LowerCtx<'_>, pname: String, poc_name: String, st: ScalarTy, dom: Domain, by_ref: bool, mutable: bool) -> Option<()> {
     let pidx = ctx.prog.param_domains.len(); let pid = ctx.prog.add_named_param(&pname, dom); if by_ref && mutable { ctx.mut_refs.insert(pname.clone()); }
@@ -1277,7 +1546,7 @@ fn lower_concrete_param(ctx: &mut LowerCtx<'_>, c: &mut Cursor<'_>, item: &FnIte
                 let bid = if is_uninit { ctx.prog.add_uninit_buf(&pname, len, mutable, region, offset, ov.unwrap_or_else(|| ety.domain())) } else { ctx.prog.add_buf(&pname, len, mutable, region, offset, ov.unwrap_or_else(|| ety.domain())) };
                 if mutable { ctx.mut_refs.insert(pname.clone()); }
                 ctx.poc_params.push(PocParam::Array { name: poc_name, ety, len, by_ref: true, mutable });
-                ctx.vars.insert(pname, Val::Buf(BufBind { id: bid, base_const: 0, base_node: None, len_const: len, len_node: None, root_len: None, mutable, elem_ty: ety })); return Some(());
+                ctx.vars.insert(pname, Val::Buf(BufBind { id: bid, base_const: 0, base_node: None, len_const: len, len_node: None, root_len: None, mutable, elem_ty: ety, is_str: false })); return Some(());
             }
             if !c.eat_sym("]") { return None; }
             let spec = if mutable { format!("mut_slice_len:{pname}:{}", ety.as_str()) } else { format!("slice_len:{pname}:{}", ety.as_str()) };
@@ -1285,36 +1554,36 @@ fn lower_concrete_param(ctx: &mut LowerCtx<'_>, c: &mut Cursor<'_>, item: &FnIte
             let bid = if is_uninit { ctx.prog.add_uninit_buf(&pname, MAX_SYM_SLICE_LEN, mutable, region, offset, ety.domain()) } else { ctx.prog.add_buf(&pname, MAX_SYM_SLICE_LEN, mutable, region, offset, ety.domain()) };
             if mutable { ctx.mut_refs.insert(pname.clone()); }
             ctx.poc_params.push(PocParam::Slice { name: poc_name, ety, pidx, mutable });
-            ctx.vars.insert(pname, Val::Buf(BufBind { id: bid, base_const: 0, base_node: None, len_const: MAX_SYM_SLICE_LEN, len_node: Some(len_pid), root_len: Some(len_pid), mutable, elem_ty: ety })); return Some(());
+            ctx.vars.insert(pname, Val::Buf(BufBind { id: bid, base_const: 0, base_node: None, len_const: MAX_SYM_SLICE_LEN, len_node: Some(len_pid), root_len: Some(len_pid), mutable, elem_ty: ety, is_str: false })); return Some(());
         }
-        let tname = ctx.resolve_ty(&c.expect_ident()?).to_string();
+        let raw_t = c.expect_ident()?;
+        if raw_t == "str" || raw_t == "String" { return add_str_param(ctx, pname, poc_name, ov, reg_ov, false); }
+        if matches!(c.peek(), Some(Tok::Sym("<"))) { c.skip_angles(); }
+        let tname = ctx.resolve_ty(&raw_t).to_string();
         if let Some(st) = ctx.file.resolve_scalar(&tname) { return push_scalar_param(ctx, pname, poc_name, st, ov.unwrap_or_else(|| st.domain()), true, mutable); }
-        if !mutable || item.is_async {
-            if let Some((sv, fields)) = add_struct_params(ctx, &pname, &tname) {
-                if mutable { ctx.mut_refs.insert(pname.clone()); }
-                ctx.poc_params.push(PocParam::Struct { name: poc_name, ty: tname, fields, by_ref: true, mutable }); ctx.vars.insert(pname, sv); return Some(());
-            }
-        }
-        return None;
-    }
+        if let Some((sv, fields)) = add_struct_params(ctx, &pname, &tname, mutable) {
+            if mutable { ctx.mut_refs.insert(pname.clone()); }
+            ctx.poc_params.push(PocParam::Struct { name: poc_name, ty: tname, fields, by_ref: true, mutable }); ctx.vars.insert(pname, sv); return Some(()); }
+        return None; }
     if c.eat_sym("[") {
         let ety = c.expect_ident().and_then(|e| ctx.file.resolve_scalar(&e))?; if !c.eat_sym(";") { return None; }
         let len_i = ctx.file.eval_const_expr(c, item.self_ty.as_deref())?.0; if len_i <= 0 || len_i > 64 || !c.eat_sym("]") { return None; }
         let (region, offset) = reg_ov.unwrap_or_else(|| (ctx.alloc_region(), 0)); let bid = ctx.prog.add_buf(&pname, len_i as usize, bind_mut, region, offset, ov.unwrap_or_else(|| ety.domain()));
         ctx.poc_params.push(PocParam::Array { name: poc_name, ety, len: len_i as usize, by_ref: false, mutable: false });
-        ctx.vars.insert(pname, Val::Buf(BufBind { id: bid, base_const: 0, base_node: None, len_const: len_i as usize, len_node: None, root_len: None, mutable: bind_mut, elem_ty: ety })); return Some(());
+        ctx.vars.insert(pname, Val::Buf(BufBind { id: bid, base_const: 0, base_node: None, len_const: len_i as usize, len_node: None, root_len: None, mutable: bind_mut, elem_ty: ety, is_str: false })); return Some(());
     }
     let raw = c.expect_ident()?;
+    if raw == "String" { return add_str_param(ctx, pname, poc_name, ov, reg_ov, true); }
     if raw == "Option" && c.eat_sym("<") {
         let it = ctx.file.resolve_scalar(&c.expect_ident()?)?; if !c.eat_sym(">") { return None; }
         let (is_some_idx, is_some) = (ctx.prog.param_domains.len(), ctx.prog.add_named_param(format!("{pname}_is_some"), Domain::range(0, 1)));
         let (val_idx, val) = (ctx.prog.param_domains.len(), ctx.prog.add_named_param(format!("{pname}_val"), ov.unwrap_or_else(|| it.domain())));
         ctx.poc_params.push(PocParam::Opt { name: poc_name, ty: it, is_some: is_some_idx, val: val_idx });
-        ctx.vars.insert(pname, Val::Opt { is_some, payload: Box::new(Val::Scalar(val, Some(it))) }); return Some(());
-    }
+        ctx.vars.insert(pname, Val::Opt { is_some, payload: Box::new(Val::Scalar(val, Some(it))) }); return Some(()); }
+    if matches!(c.peek(), Some(Tok::Sym("<"))) { c.skip_angles(); }
     let tname = ctx.resolve_ty(&raw).to_string();
     if let Some(st) = ctx.file.resolve_scalar(&tname) { return push_scalar_param(ctx, pname, poc_name, st, ov.unwrap_or_else(|| st.domain()), false, false); }
-    if let Some((sv, fields)) = add_struct_params(ctx, &pname, &tname) { ctx.poc_params.push(PocParam::Struct { name: poc_name, ty: tname, fields, by_ref: false, mutable: false }); ctx.vars.insert(pname, sv); return Some(()); }
+    if let Some((sv, fields)) = add_struct_params(ctx, &pname, &tname, false) { ctx.poc_params.push(PocParam::Struct { name: poc_name, ty: tname, fields, by_ref: false, mutable: false }); ctx.vars.insert(pname, sv); return Some(()); }
     if let Some(ed) = ctx.file.enums.get(&tname) {
         let pidx = ctx.prog.param_domains.len(); let pid = ctx.prog.add_named_param(&pname, Domain::range(0, ed.max_disc));
         ctx.poc_params.push(PocParam::Enum { name: poc_name, ty: tname, pidx, by_ref: false }); ctx.vars.insert(pname, Val::Scalar(pid, Some(ScalarTy::Usize))); return Some(());
@@ -1329,20 +1598,17 @@ fn lower_param(ctx: &mut LowerCtx<'_>, c: &mut Cursor<'_>, item: &FnItem) -> Opt
     let (is_ref_self, is_mut_self) = (c.eat_sym("&"), c.eat_ident("mut"));
     if c.eat_ident("self") {
         let st_name = item.self_ty.as_deref()?;
-        if let Some((sv, fields)) = add_struct_params(ctx, "self", st_name) {
+        if let Some((sv, fields)) = add_struct_params(ctx, "self", st_name, is_ref_self && is_mut_self) {
             if is_ref_self && is_mut_self { ctx.mut_refs.insert("self".to_string()); }
             ctx.poc_params.push(PocParam::Struct { name: "self_val".to_string(), ty: st_name.to_string(), fields, by_ref: is_ref_self, mutable: is_ref_self && is_mut_self });
-            ctx.vars.insert("self".to_string(), sv); return Some(());
-        }
+            ctx.vars.insert("self".to_string(), sv); return Some(()); }
         if let Some(ed) = ctx.file.enums.get(st_name) {
             if is_ref_self && is_mut_self { return None; }
             let pidx = ctx.prog.param_domains.len(); let pid = ctx.prog.add_named_param("self", Domain::range(0, ed.max_disc));
             ctx.poc_params.push(PocParam::Enum { name: "self_val".to_string(), ty: st_name.to_string(), pidx, by_ref: is_ref_self });
-            ctx.vars.insert("self".to_string(), Val::Scalar(pid, Some(ScalarTy::Usize))); return Some(());
-        }
+            ctx.vars.insert("self".to_string(), Val::Scalar(pid, Some(ScalarTy::Usize))); return Some(()); }
         if item.is_async { ctx.has_opaque = true; ctx.vars.insert("self".to_string(), Val::Opaque); return Some(()); }
-        return None;
-    }
+        return None; }
     if is_ref_self { return None; }
     let (bind_mut, pname) = (is_mut_self, c.expect_ident()?); if !c.eat_sym(":") { return None; }
     let (ty_pos, poc_name) = (c.pos, if pname == "_" { format!("p{}", ctx.poc_params.len()) } else { pname.clone() });
@@ -1361,14 +1627,13 @@ fn validate_ret_ty(c: &mut Cursor<'_>, idx: &FileIndex, self_ty: Option<&str>) -
         while !c.eat_sym(")") {
             let _ = c.eat_sym("&"); let _ = c.eat_ident("mut");
             if c.eat_sym("[") { eat_bracket_ret(c, idx, self_ty)?; }
-            else { let nm = c.expect_ident()?; let rn = if nm == "Self" { self_ty? } else { nm.as_str() }; if idx.resolve_scalar(rn).is_none() && !idx.structs.contains_key(rn) && !idx.enums.contains_key(rn) { return None; } }
-            let _ = c.eat_sym(",");
-        }
+            else { let nm = c.expect_ident()?; if matches!(c.peek(), Some(Tok::Sym("<"))) { c.skip_angles(); } let rn = if nm == "Self" { self_ty? } else { nm.as_str() }; if rn != "str" && rn != "String" && idx.resolve_scalar(rn).is_none() && !idx.structs.contains_key(rn) && !idx.enums.contains_key(rn) { return None; } }
+            let _ = c.eat_sym(","); }
         false
     } else if c.eat_sym("&") {
         let _ = c.eat_ident("mut");
         if c.eat_sym("[") { eat_bracket_ret(c, idx, self_ty)?; }
-        else { let nm = c.expect_ident()?; let rn = if nm == "Self" { self_ty? } else { nm.as_str() }; if idx.resolve_scalar(rn).is_none() && !idx.structs.contains_key(rn) { return None; } }
+        else { let nm = c.expect_ident()?; if matches!(c.peek(), Some(Tok::Sym("<"))) { c.skip_angles(); } let rn = if nm == "Self" { self_ty? } else { nm.as_str() }; if rn != "str" && rn != "String" && idx.resolve_scalar(rn).is_none() && !idx.structs.contains_key(rn) { return None; } }
         false
     } else if c.eat_sym("[") {
         idx.resolve_scalar(&c.expect_ident()?)?; if !c.eat_sym(";") { return None; }
@@ -1376,27 +1641,27 @@ fn validate_ret_ty(c: &mut Cursor<'_>, idx: &FileIndex, self_ty: Option<&str>) -
     } else {
         let mut nm = c.expect_ident()?; while c.eat_sym("::") { nm = c.expect_ident()?; }
         if (nm == "Option" || nm == "Result") && matches!(c.peek(), Some(Tok::Sym("<"))) { c.skip_angles(); true }
-        else { let rn = if nm == "Self" { self_ty? } else { nm.as_str() }; if idx.resolve_scalar(rn).is_none() && !idx.structs.contains_key(rn) && !idx.enums.contains_key(rn) { return None; } false }
+        else { if matches!(c.peek(), Some(Tok::Sym("<"))) { c.skip_angles(); } let rn = if nm == "Self" { self_ty? } else { nm.as_str() }; if rn != "str" && rn != "String" && idx.resolve_scalar(rn).is_none() && !idx.structs.contains_key(rn) && !idx.enums.contains_key(rn) { return None; } false }
     }; if c.eat_ident("where") { c.skip_until("{", ";", false); }
     matches!(c.peek(), Some(Tok::Sym("{"))).then_some(ret_opt)
 }
 fn lower_fn_item(item: &FnItem, file: &FileIndex, toks: &[Tok], inlined: &mut BTreeSet<String>, opts: RustFeOptions) -> Option<LoweredFn> {
-    if item.is_unsafe { return None; }
+    if item.is_unsafe || (!item.is_pub && item.in_generic_impl && !item.is_async) { return None; }
     let (mut c, mut has_opaque) = (Cursor { toks, pos: item.sig_pos }, false);
     if !c.eat_empty_generics() { if !item.is_async { return None; } c.pos = item.sig_pos; c.skip_angles(); has_opaque = true; }
     if !c.eat_sym("(") { return None; }
     let mut prog = Program::new(&item.name); prog.simd_lanes = 1; prog.check_reg_budget = opts.enforce_reg_budget;
     let mut ctx = LowerCtx {
         prog, poc_params: Vec::new(), vars: BTreeMap::new(), mut_refs: BTreeSet::new(), stores: Vec::new(), cur_guard: None, early_rets: Vec::new(), file, toks,
-        depth: 0, inlined_fns: inlined, next_region: 1, self_ty: item.self_ty.clone(), no_struct_lit: false, returns_opt: false, is_async: item.is_async, has_opaque,
+        depth: 0, loop_depth: 0, in_loop: false, inlined_fns: inlined, next_region: 1, self_ty: item.self_ty.clone(), no_struct_lit: false, returns_opt: false,
+        is_async: item.is_async, has_opaque, utf8: Utf8State::default(),
     }; while !c.eat_sym(")") { lower_param(&mut ctx, &mut c, item)?; let _ = c.eat_sym(","); }
     ctx.returns_opt = validate_ret_ty(&mut c, file, item.self_ty.as_deref())?; let (rets, tail, _) = ctx.parse_block(&mut c)?; let mut final_val = tail.or_else(|| rets.into_iter().next());
     for (cond, ev) in std::mem::take(&mut ctx.early_rets).into_iter().rev() {
         final_val = Some(match final_val {
             Some(cur) if ctx.is_const_zero_opt(&cur) && matches!(ev, Val::Opt { .. }) => { let nc = ctx.mk_bool(cond, false); ctx.merge_val(nc, cur, ev, None)? }
             Some(cur) => ctx.merge_val(cond, ev, cur, None)?, None => ev,
-        });
-    }
+        }); }
     if let Some(fv) = final_val { let mut flat = Vec::new(); LowerCtx::flatten_val(&fv, &mut flat); for r in flat { ctx.prog.add_output(r); } }
     for s in ctx.stores { if !ctx.prog.outputs.contains(&s) { ctx.prog.add_output(s); } }
     Some(LoweredFn { prog: ctx.prog, params: ctx.poc_params, is_async: ctx.is_async, has_opaque: ctx.has_opaque })
@@ -1413,11 +1678,11 @@ fn render_poc_test(lf: &LoweredFn, file: &FileIndex, ce: &Counterexample) -> Str
             PocParam::Scalar { name, ty, pidx, by_ref, mutable } => { let (kw, a) = ref_arg(name, *by_ref, *mutable); (format!("    {kw} {name}: {} = {};\n", ty.as_str(), fmt_scalar(*ty, ce.inputs.get(*pidx).copied().unwrap_or(0))), a) }
             PocParam::Array { name, ety, len, by_ref, mutable } => { let (kw, a) = ref_arg(name, *by_ref, *mutable); (format!("    {kw} {name}: [{}; {len}] = [Default::default(); {len}];\n", ety.as_str()), a) }
             PocParam::Slice { name, ety, pidx, mutable } => { let len = usize::try_from(ce.inputs.get(*pidx).copied().unwrap_or(0)).map_or(0, |n| n.min(MAX_SYM_SLICE_LEN)); let (kw, a) = ref_arg(name, true, *mutable); (format!("    {kw} {name}: Vec<{}> = vec![Default::default(); {len}];\n", ety.as_str()), a) }
+            PocParam::Str { name, pidx, owned } => { let len = usize::try_from(ce.inputs.get(*pidx).copied().unwrap_or(0)).map_or(0, |n| n.min(MAX_SYM_SLICE_LEN)); if *owned { (format!("    let {name}: String = \"a\".repeat({len});\n"), name.clone()) } else { (format!("    let {name}: String = \"a\".repeat({len});\n"), format!("&{name}")) } }
             PocParam::Opt { name, ty, is_some, val } => { let rhs = if ce.inputs.get(*is_some).copied().unwrap_or(0) != 0 { format!("Some({})", fmt_scalar(*ty, ce.inputs.get(*val).copied().unwrap_or(0))) } else { "None".to_string() }; (format!("    let {name}: Option<{}> = {rhs};\n", ty.as_str()), name.clone()) }
             PocParam::Struct { name, ty, fields, by_ref, mutable } => { let (kw, a) = ref_arg(name, *by_ref, *mutable); let fs: Vec<String> = fields.iter().map(|(f, ft, idx)| format!("{f}: {}", fmt_scalar(*ft, ce.inputs.get(*idx).copied().unwrap_or(0)))).collect(); (format!("    {kw} {name} = {ty} {{ {} }};\n", fs.join(", ")), a) }
             PocParam::Enum { name, ty, pidx, by_ref } => { let v = ce.inputs.get(*pidx).copied().unwrap_or(0); let vn = file.enums.get(ty).and_then(|e| e.variants.iter().find(|(_, &d)| d == v).or_else(|| e.variants.iter().next())).map_or("_", |(k, _)| k.as_str()); let (kw, a) = ref_arg(name, *by_ref, false); (format!("    {kw} {name} = {ty}::{vn};\n"), a) }
-        }; out.push_str(&line); args.push(arg);
-    }
+        }; out.push_str(&line); args.push(arg); }
     let call = format!("{}({})", lf.prog.name, args.join(", "));
     if lf.is_async { out.push_str(&format!("    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());\n    let mut fut = std::pin::pin!({call});\n    for _ in 0..8 {{ if std::future::Future::poll(fut.as_mut(), &mut cx).is_ready() {{ break; }} }}\n}}\n")); }
     else { out.push_str(&format!("    let _ = {call};\n}}\n")); }
@@ -1427,11 +1692,321 @@ fn extract_poc(lf: &LoweredFn, file: &FileIndex, error: &VerifyError, cfg: Refin
     if lf.has_opaque { return None; }
     let ce = match error {
         VerifyError::CounterexampleFound { node, fault, inputs } => Counterexample { inputs: inputs.clone(), node: *node, fault: *fault },
-        VerifyError::DivByZero { .. } | VerifyError::OutOfBounds { .. } | VerifyError::ExplicitPanic { .. } | VerifyError::ShiftOverflow { .. } | VerifyError::IntOverflow { .. } | VerifyError::UseAfterFree { .. } | VerifyError::DoubleFree { .. } | VerifyError::UninitializedRead { .. } =>
+        VerifyError::DivByZero { .. } | VerifyError::OutOfBounds { .. } | VerifyError::ExplicitPanic { .. } | VerifyError::Utf8CharBoundary { .. } | VerifyError::ShiftOverflow { .. } | VerifyError::IntOverflow { .. } | VerifyError::UseAfterFree { .. } | VerifyError::DoubleFree { .. } | VerifyError::UninitializedRead { .. } =>
             sample_counterexample(&lf.prog, cfg.seed).or_else(|| refine_and_fuzz(&lf.prog, RefineConfig { max_epochs: 1, fuzz_ticks_per_box: 1, ..cfg }).counterexamples.into_iter().next())?,
         _ => return None,
     };
     Some(render_poc_test(lf, file, &ce))
+}
+struct Utf8AuditEnv {
+    str_vars: BTreeSet<String>, safe_vars: BTreeSet<String>, safe_plus: BTreeMap<String, BTreeSet<i64>>,
+    safe_minus: BTreeMap<String, BTreeSet<i64>>, ascii_ok: BTreeSet<String>,
+    starts: BTreeMap<String, BTreeSet<i64>>, ends: BTreeMap<String, BTreeSet<i64>>,
+}
+fn is_safe_str_bound(sl: &[Tok], var: &str, env: &Utf8AuditEnv, st: &BTreeSet<i64>, en: &BTreeSet<i64>) -> bool {
+    match sl {
+        [] | [Tok::Int(0, _)] => true,
+        [Tok::Int(k, _)] => st.contains(k),
+        [Tok::Ident(v)] => env.safe_vars.contains(v),
+        [Tok::Ident(v), Tok::Sym("."), Tok::Ident(m), Tok::Sym("("), Tok::Int(0, _), Tok::Sym(")")] if m == "unwrap_or" => env.safe_vars.contains(v),
+        [Tok::Ident(v), Tok::Sym("."), Tok::Ident(m), Tok::Sym("("), Tok::Sym(")")] if v == var && m == "len" => true,
+        [Tok::Ident(v), Tok::Sym("."), Tok::Ident(m), Tok::Sym("("), Tok::Sym(")"), Tok::Sym("-"), Tok::Int(k, _)] if v == var && m == "len" => en.contains(k),
+        [Tok::Ident(v), Tok::Sym("+"), Tok::Ident(c), Tok::Sym("."), Tok::Ident(m), Tok::Sym("("), Tok::Sym(")")] if env.safe_vars.contains(v) && m == "len_utf8" && !c.is_empty() => true,
+        [Tok::Ident(v), Tok::Sym("+"), Tok::Int(k, _)] => env.safe_plus.get(v).is_some_and(|ks| ks.contains(k)),
+        [Tok::Ident(v), Tok::Sym("-"), Tok::Int(k, _)] => env.safe_minus.get(v).is_some_and(|ks| ks.contains(k)),
+        _ => sl.iter().any(|t| matches!(t, Tok::Ident(w) if matches!(w.as_str(), "len_utf8" | "floor_char_boundary" | "ceil_char_boundary"))),
+    }
+}
+fn find_ascii_needle_len(win: &[Tok]) -> Option<i64> {
+    for (j, x) in win.iter().enumerate() {
+        if matches!(x, Tok::Ident(w) if w == "find" || w == "rfind") && matches!(win.get(j + 1), Some(Tok::Sym("("))) {
+            return match win.get(j + 2) {
+                Some(&Tok::Str(l, true)) => Some(l as i64),
+                Some(&Tok::Int(v, _)) if (0..128).contains(&v) => Some(1),
+                Some(Tok::Sym("@")) => Some(1),
+                _ => None,
+            }; }
+    }
+    None
+}
+type FnSigBody<'a> = (Vec<(String, &'a [Tok])>, &'a [Tok]);
+fn fn_sig_and_body<'a>(item: &FnItem, toks: &'a [Tok]) -> Option<FnSigBody<'a>> {
+    let mut c = Cursor { toks, pos: item.sig_pos };
+    if matches!(c.peek(), Some(Tok::Sym("<"))) { c.skip_angles(); }
+    if !c.eat_sym("(") { return None; }
+    let mut params = Vec::new();
+    while !c.eat_sym(")") {
+        let p0 = c.pos; let mut d = 0usize;
+        while let Some(t) = c.peek() {
+            match t { Tok::Sym("," | ")") if d == 0 => break, Tok::Sym("(" | "[" | "<") => { d += 1; c.pos += 1; } Tok::Sym(")" | "]" | ">") => { d = d.saturating_sub(1); c.pos += 1; } Tok::Sym(">>") => { d = d.saturating_sub(2); c.pos += 1; } _ => c.pos += 1 }
+        }
+        let seg = toks.get(p0..c.pos).unwrap_or(&[]);
+        if let Some(cp) = seg.iter().position(|t| matches!(t, Tok::Sym(":"))) {
+            let ty = seg.get(cp + 1..).unwrap_or(&[]);
+            let nm = seg.get(..cp).and_then(|l| l.iter().rev().find_map(|t| if let Tok::Ident(w) = t { (w != "mut" && w != "ref").then(|| w.clone()) } else { None })).unwrap_or_default();
+            params.push((nm, ty)); }
+        let _ = c.eat_sym(","); }
+    c.skip_until("{", ";", false); if !matches!(c.peek(), Some(Tok::Sym("{"))) { return None; }
+    let bs = c.pos; c.skip_balanced("{", "}"); Some((params, toks.get(bs..c.pos).unwrap_or(&[])))
+}
+fn collect_ascii_byte_preds(file: &FileIndex, toks: &[Tok]) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    for f in &file.fns {
+        if f.self_ty.is_some() { continue; }
+        let Some((params, body)) = fn_sig_and_body(f, toks) else { continue; };
+        if !matches!(params.as_slice(), [(nm, [Tok::Ident(ty)])] if !nm.is_empty() && ty == "u8") { continue; }
+        let has_ascii = body.iter().any(|t| matches!(t, Tok::Ident(m) if m.starts_with("is_ascii")));
+        let bad = body.iter().any(|t| matches!(t, Tok::Int(v, _) if !(0..128).contains(v)) || matches!(t, Tok::Sym("!" | "!=" | ">" | ">=")));
+        if has_ascii && !bad { out.insert(f.name.clone()); }
+    }
+    out
+}
+fn collect_quote_scanners(file: &FileIndex, toks: &[Tok], out: &mut BTreeSet<String>) {
+    for f in &file.fns {
+        if f.self_ty.is_some() { continue; }
+        let Some((params, body)) = fn_sig_and_body(f, toks) else { continue; };
+        let is_pat = |i: usize| matches!(body.get(i.saturating_sub(1)), Some(Tok::Sym("=="))) || matches!(body.get(i.saturating_sub(1)), Some(Tok::Ident(w)) if w == "let");
+        if let [(bn, [Tok::Sym("&"), Tok::Sym("["), Tok::Ident(u), Tok::Sym("]")]), (qn, [Tok::Ident(uz)])] = params.as_slice() {
+            if u != "u8" || uz != "usize" || !body.windows(4).any(|w| matches!(w, [Tok::Ident(b), Tok::Sym("["), Tok::Ident(q), Tok::Sym("]")] if b == bn && q == qn)) { continue; }
+            let (mut saw, mut ok) = (false, true);
+            for (i, t) in body.iter().enumerate() {
+                if matches!(t, Tok::Ident(w) if w == "Some") && matches!(body.get(i + 1), Some(Tok::Sym("("))) {
+                    if matches!(body.get(i + 2..i + 6), Some([Tok::Ident(ix), Tok::Sym("+"), Tok::Int(1, _), Tok::Sym(")")]) if body.windows(5).any(|w| matches!(w, [Tok::Ident(b), Tok::Sym("["), Tok::Ident(j), Tok::Sym("]"), Tok::Sym("==")] if b == bn && j == ix))) { saw = true; }
+                    else if !is_pat(i) { ok = false; }
+                }
+            }
+            if saw && ok { out.insert(f.name.clone()); }
+            else if !saw && ok && body.windows(6).any(|w| matches!(w, [Tok::Ident(b), Tok::Sym("["), Tok::Ident(q), Tok::Sym("]"), Tok::Sym("."), Tok::Ident(m)] if b == bn && q == qn && m.starts_with("is_ascii"))) && body.windows(2).any(|w| matches!(w, [Tok::Ident(r), Tok::Ident(q)] if r == "return" && q == qn)) { out.insert(format!("skip:{}", f.name)); }
+        } else if let [(bn, [Tok::Sym("&"), Tok::Sym("["), Tok::Ident(u), Tok::Sym("]")]), (_, [Tok::Ident(uz)]), (_, [Tok::Ident(u2)]), (cn, [Tok::Ident(u3)])] = params.as_slice() {
+            if u != "u8" || uz != "usize" || u2 != "u8" || u3 != "u8" { continue; }
+            let (mut saw, mut ok) = (false, true);
+            for (i, t) in body.iter().enumerate() {
+                if matches!(t, Tok::Ident(w) if w == "Some") && matches!(body.get(i + 1), Some(Tok::Sym("("))) {
+                    if matches!(body.get(i + 2..i + 4), Some([Tok::Ident(ix), Tok::Sym(")")]) if body.windows(6).any(|w| matches!(w, [Tok::Ident(b), Tok::Sym("["), Tok::Ident(j), Tok::Sym("]"), Tok::Sym("=="), Tok::Ident(c)] if b == bn && j == ix && c == cn))) { saw = true; }
+                    else if !is_pat(i) { ok = false; }
+                }
+            }
+            if saw && ok { out.insert(format!("delim:{}", f.name)); }
+        }
+    }
+}
+fn split_top_commas(sl: &[Tok]) -> Vec<&[Tok]> {
+    let (mut parts, mut s, mut d) = (Vec::new(), 0usize, 0usize);
+    for (i, t) in sl.iter().enumerate() {
+        match t { Tok::Sym("(" | "[" | "{") => d += 1, Tok::Sym(")" | "]" | "}") => d = d.saturating_sub(1), Tok::Sym(",") if d == 0 => { parts.push(sl.get(s..i).unwrap_or(&[])); s = i + 1; } _ => {} }
+    }
+    if s <= sl.len() { parts.push(sl.get(s..).unwrap_or(&[])); }
+    parts
+}
+fn build_utf8_env<'a>(item: &FnItem, file: &FileIndex, toks: &'a [Tok], preds: &BTreeSet<String>, qscans: &BTreeSet<String>, init_safe: &BTreeSet<String>, init_plus: &BTreeMap<String, BTreeSet<i64>>) -> Option<(Utf8AuditEnv, &'a [Tok])> {
+    let (params, body) = fn_sig_and_body(item, toks)?;
+    let mut env = Utf8AuditEnv {
+        str_vars: BTreeSet::new(), safe_vars: init_safe.clone(), safe_plus: init_plus.clone(),
+        safe_minus: BTreeMap::new(), ascii_ok: BTreeSet::new(), starts: BTreeMap::new(), ends: BTreeMap::new(),
+    };
+    for (nm, ty) in &params {
+        if matches!(ty, [Tok::Sym("&"), Tok::Ident(s)] | [Tok::Ident(s)] if s == "str" || s == "String") && !nm.is_empty() { env.str_vars.insert(nm.clone()); }
+    }
+    if let Some(st) = item.self_ty.as_deref().and_then(|n| file.structs.get(n)) {
+        for (f, t) in &st.fields { if matches!(t, FieldTy::Str) { env.str_vars.insert(f.clone()); } }
+    }
+    let (mut bytes_of, mut byte_var, mut char_of, mut safe_ranges) = (BTreeMap::<String, String>::new(), BTreeMap::<String, (String, String)>::new(), BTreeMap::<String, String>::new(), BTreeSet::<String>::new());
+    for (i, t) in body.iter().enumerate() {
+        if matches!(t, Tok::Ident(w) if w == "let") {
+            if matches!(body.get(i + 1), Some(Tok::Sym("("))) {
+                let mut lp = Cursor { toks: body, pos: i + 1 }; lp.skip_balanced("(", ")");
+                let lhs_parts = split_top_commas(body.get(i + 2..lp.pos.saturating_sub(1)).unwrap_or(&[]));
+                if matches!(body.get(lp.pos), Some(Tok::Sym("="))) && matches!(body.get(lp.pos + 1), Some(Tok::Sym("("))) {
+                    let mut rp = Cursor { toks: body, pos: lp.pos + 1 }; rp.skip_balanced("(", ")");
+                    let rhs_parts = split_top_commas(body.get(lp.pos + 2..rp.pos.saturating_sub(1)).unwrap_or(&[]));
+                    for (lp_s, rp_s) in lhs_parts.iter().zip(rhs_parts.iter()) {
+                        let Some(Tok::Ident(nm)) = lp_s.iter().rev().find(|x| matches!(x, Tok::Ident(w) if w != "mut")) else { continue; };
+                        if let [Tok::Ident(sv), Tok::Sym("."), Tok::Ident(m), Tok::Sym("("), Tok::Sym(")")] = rp_s {
+                            if m == "as_bytes" && env.str_vars.contains(sv) { bytes_of.insert(nm.clone(), sv.clone()); }
+                        } else if matches!(rp_s, [Tok::Sym("&"), Tok::Ident(sv), Tok::Sym("["), ..] | [Tok::Ident(sv), Tok::Sym("["), ..] if env.str_vars.contains(sv)) {
+                            env.str_vars.insert(nm.clone());
+                        } else if let [Tok::Ident(bv), Tok::Sym("["), Tok::Ident(iv), Tok::Sym("]")] = rp_s {
+                            if bytes_of.contains_key(bv) { byte_var.insert(nm.clone(), (bv.clone(), iv.clone())); }
+                        } else if let [Tok::Ident(src)] = rp_s {
+                            if env.safe_vars.contains(src) { env.safe_vars.insert(nm.clone()); }
+                        }
+                    }
+                }
+            } else {
+                let mut k = i + 1; if matches!(body.get(k), Some(Tok::Ident(w)) if w == "mut") { k += 1; }
+                if let Some(Tok::Ident(nm)) = body.get(k) {
+                    let win = body.get(k..body.len().min(k + 12)).unwrap_or(&[]);
+                    let has_str_m = win.windows(2).any(|w| matches!(w, [Tok::Sym("."), Tok::Ident(m)] if m == "as_str" || (matches!(m.as_str(), "trim" | "trim_start" | "trim_end") && win.iter().any(|x| matches!(x, Tok::Ident(v) if env.str_vars.contains(v))))));
+                    if has_str_m || matches!(body.get(k + 1..k + 4), Some([Tok::Sym(":"), Tok::Sym("&"), Tok::Ident(s)]) if s == "str") { env.str_vars.insert(nm.clone()); }
+                    if let Some([Tok::Sym("="), Tok::Ident(sv), Tok::Sym("."), Tok::Ident(m), ..]) = body.get(k + 1..body.len().min(k + 6)) {
+                        if m == "as_bytes" && env.str_vars.contains(sv) { bytes_of.insert(nm.clone(), sv.clone()); }
+                    }
+                    if let Some([Tok::Sym("="), Tok::Ident(bv), Tok::Sym("["), Tok::Ident(iv), Tok::Sym("]")]) = body.get(k + 1..k + 6) {
+                        if bytes_of.contains_key(bv) { byte_var.insert(nm.clone(), (bv.clone(), iv.clone())); }
+                    }
+                    if win.iter().any(|x| matches!(x, Tok::Ident(w) if matches!(w.as_str(), "find" | "rfind" | "char_indices" | "match_indices" | "len_utf8"))) {
+                        env.safe_vars.insert(nm.clone());
+                        if let Some(nl) = find_ascii_needle_len(win) { env.safe_plus.entry(nm.clone()).or_default().insert(nl); }
+                    }
+                }
+            }
+        }
+        if matches!(t, Tok::Ident(w) if w == "for") && matches!(body.get(i + 1), Some(Tok::Sym("("))) {
+            if let (Some(Tok::Ident(rel)), Some(Tok::Sym(",")), Some(Tok::Ident(ch)), Some(Tok::Sym(")"))) = (body.get(i + 2), body.get(i + 3), body.get(i + 4), body.get(i + 5)) {
+                let win = body.get(i + 6..body.len().min(i + 22)).unwrap_or(&[]);
+                if win.iter().any(|x| matches!(x, Tok::Ident(w) if w == "char_indices")) { env.safe_vars.insert(rel.clone()); char_of.insert(ch.clone(), rel.clone()); }
+            }
+        }
+        if matches!(t, Tok::Ident(w) if matches!(w.as_str(), "Some" | "Ok")) && matches!(body.get(i + 1), Some(Tok::Sym("("))) {
+            if let Some(Tok::Ident(nm)) = body.get(i + 2) {
+                let win = body.get(i..body.len().min(i + 16)).unwrap_or(&[]);
+                if win.iter().any(|x| matches!(x, Tok::Ident(w) if matches!(w.as_str(), "find" | "rfind" | "char_indices"))) {
+                    env.safe_vars.insert(nm.clone());
+                    if let Some(nl) = find_ascii_needle_len(win) { env.safe_plus.entry(nm.clone()).or_default().insert(nl); }
+                }
+                if let Some([Tok::Sym(")"), Tok::Sym("="), Tok::Ident(qfn), Tok::Sym("("), Tok::Ident(bv), Tok::Sym(","), Tok::Ident(iv), Tok::Sym(")")]) = body.get(i + 3..i + 11) {
+                    if qscans.contains(qfn) && bytes_of.contains_key(bv) && env.safe_plus.get(iv).is_some_and(|ks| ks.contains(&1)) {
+                        env.safe_vars.insert(nm.clone()); env.safe_minus.entry(nm.clone()).or_default().insert(1); }
+                } else if let Some([Tok::Sym(")"), Tok::Sym("="), Tok::Ident(dfn), Tok::Sym("(")]) = body.get(i + 3..i + 7) {
+                    if qscans.contains(&format!("delim:{dfn}")) {
+                        let mut cp = Cursor { toks: body, pos: i + 6 }; cp.skip_balanced("(", ")");
+                        let args = split_top_commas(body.get(i + 7..cp.pos.saturating_sub(1)).unwrap_or(&[]));
+                        if let ([Tok::Ident(bv)], Some(&[Tok::Int(cv, _)])) = (args.first().copied().unwrap_or(&[]), args.get(3).copied()) {
+                            if (0..128).contains(&cv) && bytes_of.contains_key(bv) { env.safe_vars.insert(nm.clone()); env.safe_plus.entry(nm.clone()).or_default().insert(1); }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if env.str_vars.is_empty() { return None; }
+    for i in 0..body.len() {
+        if let (Some(Tok::Ident(v)), Some(Tok::Sym("[")), Some(Tok::Ident(rn)), Some(Tok::Sym(".")), Some(Tok::Ident(cl))) = (body.get(i), body.get(i + 1), body.get(i + 2), body.get(i + 3), body.get(i + 4)) {
+            if env.str_vars.contains(v) && cl == "clone" { safe_ranges.insert(rn.clone()); }
+        }
+        if let (Some(Tok::Ident(v)), Some(Tok::Sym(".")), Some(Tok::Ident(m))) = (body.get(i), body.get(i + 1), body.get(i + 2)) {
+            if env.str_vars.contains(v) {
+                if matches!(m.as_str(), "is_ascii" | "is_char_boundary" | "floor_char_boundary" | "ceil_char_boundary") { env.ascii_ok.insert(v.clone()); }
+                else if (m == "starts_with" || m == "ends_with") && matches!(body.get(i + 3), Some(Tok::Sym("("))) {
+                    let nl = match body.get(i + 4) { Some(&Tok::Str(l, true)) => Some(l as i64), Some(Tok::Sym("@")) => Some(1), _ => None };
+                    if let Some(k) = nl { if m == "starts_with" { env.starts.entry(v.clone()).or_default().insert(k); } else { env.ends.entry(v.clone()).or_default().insert(k); } }
+                }
+            }
+        }
+        if let (Some(Tok::Ident(ch)), Some(Tok::Sym("==")), Some(Tok::Sym("@"))) = (body.get(i), body.get(i + 1), body.get(i + 2)) {
+            if let Some(rel) = char_of.get(ch) { env.safe_plus.entry(rel.clone()).or_default().insert(1); }
+        }
+        if let (Some(Tok::Ident(bv)), Some(Tok::Sym("[")), Some(idx_t), Some(Tok::Sym("]"))) = (body.get(i), body.get(i + 1), body.get(i + 2), body.get(i + 3)) {
+            if let Some(sv) = bytes_of.get(bv) {
+                let is_ascii_chk = match (body.get(i + 4), body.get(i + 5)) {
+                    (Some(Tok::Sym("==")), Some(&Tok::Int(v, _))) if (0..128).contains(&v) => true,
+                    (Some(Tok::Sym("<")), Some(&Tok::Int(v, _))) if (1..=128).contains(&v) => true,
+                    (Some(Tok::Sym(".")), Some(Tok::Ident(m))) if m.starts_with("is_ascii") => true,
+                    _ => false,
+                } || (i >= 2 && matches!(body.get(i - 2..i), Some([Tok::Ident(p), Tok::Sym("(")]) if preds.contains(p)));
+                if is_ascii_chk {
+                    match idx_t {
+                        Tok::Int(0, _) => { env.starts.entry(sv.clone()).or_default().insert(1); }
+                        Tok::Ident(iv) => { env.safe_vars.insert(iv.clone()); env.safe_plus.entry(iv.clone()).or_default().insert(1); }
+                        _ => {}
+                    }
+                }
+                if (i >= 1 && matches!(body.get(i - 1), Some(Tok::Ident(kw)) if kw == "match")) || (i >= 2 && matches!(body.get(i - 2..i), Some([Tok::Ident(kw), Tok::Sym("(")]) if kw == "matches")) {
+                    if let Tok::Ident(iv) = idx_t { env.safe_vars.insert(iv.clone()); env.safe_plus.entry(iv.clone()).or_default().insert(1); }
+                }
+            }
+        }
+        if let Some(Tok::Ident(cv)) = body.get(i) {
+            if let Some((_, iv)) = byte_var.get(cv) {
+                let chk = matches!((body.get(i + 1), body.get(i + 2)), (Some(Tok::Sym(".")), Some(Tok::Ident(m))) if m.starts_with("is_ascii"))
+                    || matches!((body.get(i + 1), body.get(i + 2)), (Some(Tok::Sym("==")), Some(&Tok::Int(v, _))) if (0..128).contains(&v))
+                    || (i >= 2 && matches!(body.get(i - 2..i), Some([Tok::Ident(kw), Tok::Sym("(")]) if kw == "matches" || preds.contains(kw)));
+                if chk { env.safe_vars.insert(iv.clone()); env.safe_plus.entry(iv.clone()).or_default().insert(1); }
+            }
+        }
+        if matches!(body.get(i), Some(Tok::Ident(m)) if m == "eq_ignore_ascii_case") && matches!(body.get(i + 1), Some(Tok::Sym("("))) {
+            if let Some(&Tok::Str(l, true)) = body.get(i + 2) { for sv in &env.str_vars { env.starts.entry(sv.clone()).or_default().insert(l as i64); } }
+        }
+    }
+    for _ in 0..3 {
+        for i in 0..body.len() {
+            if let (Some(Tok::Ident(dst)), Some(Tok::Sym("="))) = (body.get(i), body.get(i + 1)) {
+                if let Some([Tok::Ident(w), Tok::Sym("("), Tok::Ident(rn), Tok::Sym("."), Tok::Ident(st), Tok::Sym("+"), Tok::Ident(rel), Tok::Sym(")")]) = body.get(i + 2..i + 10) {
+                    if w == "Some" && st == "start" && safe_ranges.contains(rn) && env.safe_vars.contains(rel) { env.safe_vars.insert(dst.clone()); }
+                } else if let Some(Tok::Ident(src)) = body.get(i + 2) {
+                    if env.safe_vars.contains(src) {
+                        if let Some([Tok::Sym("+"), Tok::Int(k, _)]) = body.get(i + 3..i + 5) {
+                            if env.safe_plus.get(src).is_some_and(|ks| ks.contains(k)) { env.safe_vars.insert(dst.clone()); }
+                        } else {
+                            env.safe_vars.insert(dst.clone());
+                            if let Some(ks) = env.safe_plus.get(src).cloned() { env.safe_plus.entry(dst.clone()).or_default().extend(ks); }
+                        }
+                    } else if let Some([Tok::Sym("."), Tok::Ident(st), Tok::Sym("+"), Tok::Ident(rel)]) = body.get(i + 3..i + 7) {
+                        if st == "start" && safe_ranges.contains(src) && env.safe_vars.contains(rel) {
+                            env.safe_vars.insert(dst.clone());
+                            if let Some(ks) = env.safe_plus.get(rel).cloned() { env.safe_plus.entry(dst.clone()).or_default().extend(ks); }
+                        }
+                    } else if let Some([Tok::Sym("("), Tok::Ident(bv), Tok::Sym(","), Tok::Ident(iv), Tok::Sym(")")]) = body.get(i + 3..i + 8) {
+                        if qscans.contains(&format!("skip:{src}")) && bytes_of.contains_key(bv) && env.safe_vars.contains(iv) { env.safe_vars.insert(dst.clone()); }
+                    }
+                }
+            }
+        }
+    }
+    Some((env, body))
+}
+fn caller_utf8_inits(item: &FnItem, file: &FileIndex, toks: &[Tok], preds: &BTreeSet<String>, qscans: &BTreeSet<String>) -> (BTreeSet<String>, BTreeMap<String, BTreeSet<i64>>) {
+    let (mut isafe, mut iplus) = (BTreeSet::new(), BTreeMap::new());
+    if item.is_pub || item.self_ty.is_some() { return (isafe, iplus); }
+    let Some((params, _)) = fn_sig_and_body(item, toks) else { return (isafe, iplus); };
+    let mut all_safe: Option<Vec<bool>> = None; let mut all_plus1: Option<Vec<bool>> = None;
+    for caller in &file.fns {
+        if caller.name == item.name || caller.is_test { continue; }
+        let Some((cenv, cbody)) = build_utf8_env(caller, file, toks, preds, qscans, &BTreeSet::new(), &BTreeMap::new()) else { continue; };
+        for i in 0..cbody.len() {
+            if matches!(cbody.get(i), Some(Tok::Ident(n)) if n == &item.name) && matches!(cbody.get(i + 1), Some(Tok::Sym("("))) && !matches!(cbody.get(i.saturating_sub(1)), Some(Tok::Sym(".") | Tok::Sym("::"))) {
+                let mut cp = Cursor { toks: cbody, pos: i + 1 }; cp.skip_balanced("(", ")");
+                let args = split_top_commas(cbody.get(i + 2..cp.pos.saturating_sub(1)).unwrap_or(&[]));
+                if args.len() != params.len() { continue; }
+                let sv: Vec<bool> = args.iter().map(|a| matches!(a, [Tok::Ident(v)] if cenv.safe_vars.contains(v))).collect();
+                let pv: Vec<bool> = args.iter().map(|a| matches!(a, [Tok::Ident(v)] if cenv.safe_plus.get(v).is_some_and(|ks| ks.contains(&1)))).collect();
+                all_safe = Some(all_safe.map_or(sv.clone(), |old| old.into_iter().zip(sv).map(|(a, b)| a && b).collect()));
+                all_plus1 = Some(all_plus1.map_or(pv.clone(), |old| old.into_iter().zip(pv).map(|(a, b)| a && b).collect())); }
+        }
+    }
+    if let (Some(sv), Some(pv)) = (all_safe, all_plus1) {
+        for (((nm, _), ok_s), ok_p) in params.iter().zip(sv).zip(pv) {
+            if ok_s { isafe.insert(nm.clone()); }
+            if ok_p { iplus.entry(nm.clone()).or_default().insert(1); }
+        }
+    }
+    (isafe, iplus)
+}
+fn audit_utf8_str_slices(item: &FnItem, file: &FileIndex, toks: &[Tok], preds: &BTreeSet<String>, qscans: &BTreeSet<String>) -> Option<VerifyError> {
+    let (isafe, iplus) = caller_utf8_inits(item, file, toks, preds, qscans);
+    let (env, body) = build_utf8_env(item, file, toks, preds, qscans, &isafe, &iplus)?; let empty = BTreeSet::new();
+    for i in 0..body.len() {
+        let Some(Tok::Ident(v)) = body.get(i) else { continue; };
+        if !env.str_vars.contains(v) || env.ascii_ok.contains(v) { continue; }
+        let (st, en) = (env.starts.get(v).unwrap_or(&empty), env.ends.get(v).unwrap_or(&empty));
+        if matches!(body.get(i + 1), Some(Tok::Sym("["))) {
+            let (mut j, mut d) = (i + 2, 1usize);
+            while j < body.len() && d > 0 { match body.get(j) { Some(Tok::Sym("[")) => d += 1, Some(Tok::Sym("]")) => { d -= 1; if d == 0 { break; } } _ => {} } j += 1; }
+            let rng = body.get(i + 2..j).unwrap_or(&[]);
+            if let Some(rp) = rng.iter().position(|t| matches!(t, Tok::Sym(".." | "..="))) {
+                let (lhs, rhs) = (rng.get(..rp).unwrap_or(&[]), rng.get(rp + 1..).unwrap_or(&[]));
+                if !is_safe_str_bound(lhs, v.as_str(), &env, st, en) || !is_safe_str_bound(rhs, v.as_str(), &env, st, en) {
+                    return Some(VerifyError::Utf8CharBoundary { detail: format!("unchecked &str slice on `{v}` without char-boundary/ASCII proof") }); }
+            }
+        } else if matches!(body.get(i + 1), Some(Tok::Sym("."))) && matches!(body.get(i + 2), Some(Tok::Ident(m)) if m == "split_at") && matches!(body.get(i + 3), Some(Tok::Sym("("))) {
+            let (mut j, mut d) = (i + 4, 1usize);
+            while j < body.len() && d > 0 { match body.get(j) { Some(Tok::Sym("(")) => d += 1, Some(Tok::Sym(")")) => { d -= 1; if d == 0 { break; } } _ => {} } j += 1; }
+            let arg = body.get(i + 4..j).unwrap_or(&[]);
+            if !is_safe_str_bound(arg, v.as_str(), &env, st, en) {
+                return Some(VerifyError::Utf8CharBoundary { detail: format!("unchecked `{v}.split_at(...)` without char-boundary/ASCII proof") }); }
+        }
+    }
+    None
 }
 fn parse_rust_with_poc_params(src: &str, opts: RustFeOptions) -> ParsedPocEntries {
     let (toks, mut entries, mut skipped_raw, mut inlined) = (tokenize_rust(src), Vec::new(), Vec::new(), BTreeSet::new()); let file = scan_file(&toks);
@@ -1447,8 +2022,14 @@ fn parse_rust_with_poc_params(src: &str, opts: RustFeOptions) -> ParsedPocEntrie
 }
 /// Parse Safe-Rust functions from raw `.rs` source into `Program` IR with default kernel options.
 #[must_use] pub fn parse_rust_programs(src: &str) -> ParsedRustUnit { parse_rust_programs_with_opts(src, RustFeOptions::default()) }
-fn verify_rust_unit(file: &str, src: &str, profile: ArchProfile, cfg: RefineConfig, opts: RustFeOptions) -> (RustProofReport, Vec<(usize, LoweredFn)>) {
-    let (fidx, entries, skipped_non_kernel_fns) = parse_rust_with_poc_params(src, opts); let (mut proven, mut failed, mut failed_lf) = (Vec::new(), Vec::new(), Vec::new());
+fn verify_rust_unit(file: &str, src: &str, profile: ArchProfile, cfg: RefineConfig, opts: RustFeOptions, qscans: &BTreeSet<String>) -> (RustProofReport, Vec<(usize, LoweredFn)>) {
+    let toks = tokenize_rust(src); let fidx = scan_file(&toks); let (mut entries, mut skipped_raw, mut inlined) = (Vec::new(), Vec::new(), BTreeSet::new());
+    for item in &fidx.fns {
+        if is_intrinsic(&item.name) || (opts.skip_cfg_test && item.is_test) { continue; }
+        if let Some(p) = lower_fn_item(item, &fidx, &toks, &mut inlined, opts) { entries.push(p); } else { skipped_raw.push(item.name.clone()); }
+    }
+    let skipped_non_kernel_fns: Vec<String> = skipped_raw.into_iter().filter(|n| !inlined.contains(n)).collect();
+    let (mut proven, mut failed, mut failed_lf) = (Vec::new(), Vec::new(), Vec::new());
     for lf in entries {
         let name = lf.prog.name.clone();
         match verify_program(&lf.prog, profile, cfg) {
@@ -1458,11 +2039,20 @@ fn verify_rust_unit(file: &str, src: &str, profile: ArchProfile, cfg: RefineConf
             }
         }
     }
+    if !opts.enforce_reg_budget {
+        let preds = collect_ascii_byte_preds(&fidx, &toks); let mut lq = qscans.clone(); collect_quote_scanners(&fidx, &toks, &mut lq);
+        let skipped_set: BTreeSet<&str> = skipped_non_kernel_fns.iter().map(String::as_str).collect();
+        for item in &fidx.fns {
+            if item.is_test || !skipped_set.contains(item.name.as_str()) { continue; }
+            if let Some(err) = audit_utf8_str_slices(item, &fidx, &toks, &preds, &lq) {
+                failed.push(RustFnFailure { fn_name: item.name.clone(), error: err, poc_test: None, entrypoint_trace: None }); }
+        }
+    }
     (RustProofReport { file: file.to_string(), proven, failed, suppressed_guarded: Vec::new(), skipped_non_kernel_fns }, failed_lf)
 }
 /// Parse and formally verify every supported function in a raw `.rs` source string using explicit `RustFeOptions`.
 #[must_use] pub fn verify_rust_functions_with_opts(file: &str, src: &str, profile: ArchProfile, cfg: RefineConfig, opts: RustFeOptions) -> RustProofReport {
-    let (mut rep, fl) = verify_rust_unit(file, src, profile, cfg, opts);
+    let (mut rep, fl) = verify_rust_unit(file, src, profile, cfg, opts, &BTreeSet::new());
     if opts.interprocedural_reachability && !fl.is_empty() {
         let fl_all: Vec<(usize, usize, LoweredFn)> = fl.into_iter().map(|(fi, lf)| (0, fi, lf)).collect();
         crate::callgraph::apply_interprocedural_reachability(None, &[], &[src.to_string()], std::slice::from_mut(&mut rep), &fl_all, &[], (opts.skip_cfg_test, profile, cfg));
@@ -1474,14 +2064,17 @@ fn verify_rust_unit(file: &str, src: &str, profile: ArchProfile, cfg: RefineConf
 /// Parse and verify all supported functions across a `.rs` file or crate directory using explicit `RustFeOptions`.
 pub fn verify_crate_functions_with_opts(dir: &Path, profile: ArchProfile, cfg: RefineConfig, skip: &[String], opts: RustFeOptions) -> Result<Vec<RustProofReport>, VerifyError> {
     let mut files = Vec::new(); crate::lint_rs::collect_rs_files_opts(dir, skip, opts.skip_cfg_test, &mut files)?; files.sort();
-    let (mut srcs, mut reports, mut fl_all) = (Vec::with_capacity(files.len()), Vec::with_capacity(files.len()), Vec::new());
-    for (ridx, p) in files.iter().enumerate() {
-        let src = std::fs::read_to_string(p).map_err(|e| VerifyError::Io(format!("{}: {e}", p.display())))?; let (rep, fl) = verify_rust_unit(&p.display().to_string(), &src, profile, cfg, opts);
-        fl_all.extend(fl.into_iter().map(|(fi, lf)| (ridx, fi, lf))); srcs.push(src); reports.push(rep);
-    }
+    let (mut srcs, mut qscans) = (Vec::with_capacity(files.len()), BTreeSet::new());
+    for p in &files {
+        let src = std::fs::read_to_string(p).map_err(|e| VerifyError::Io(format!("{}: {e}", p.display())))?;
+        if !opts.enforce_reg_budget && src.contains("Option<usize>") { let t = tokenize_rust(&src); collect_quote_scanners(&scan_file(&t), &t, &mut qscans); }
+        srcs.push(src); }
+    let (mut reports, mut fl_all) = (Vec::with_capacity(files.len()), Vec::new());
+    for (ridx, (p, src)) in files.iter().zip(srcs.iter()).enumerate() {
+        let (rep, fl) = verify_rust_unit(&p.display().to_string(), src, profile, cfg, opts, &qscans);
+        fl_all.extend(fl.into_iter().map(|(fi, lf)| (ridx, fi, lf))); reports.push(rep); }
     if opts.interprocedural_reachability && !fl_all.is_empty() {
-        crate::callgraph::apply_interprocedural_reachability(Some(dir), &files, &srcs, &mut reports, &fl_all, skip, (opts.skip_cfg_test, profile, cfg));
-    }
+        crate::callgraph::apply_interprocedural_reachability(Some(dir), &files, &srcs, &mut reports, &fl_all, skip, (opts.skip_cfg_test, profile, cfg)); }
     Ok(reports)
 }
 /// Parse and verify all supported functions across a `.rs` file or crate directory.

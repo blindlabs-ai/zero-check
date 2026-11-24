@@ -37,6 +37,7 @@ crate::define_errors!(pub VerifyError {
     ShiftOverflow { node: NodeId, lo: i64, hi: i64 } => ("node {node}: shift [{lo},{hi}] outside 0..64"),
     DivByZero { node: NodeId } => ("node {node}: div/rem by zero or i64::MIN / -1"),
     ExplicitPanic { node: NodeId } => ("node {node}: reachable panic/assert/unwrap"),
+    Utf8CharBoundary { detail: String } => ("utf8 char boundary: {detail}"),
     RegisterSpill { profile: ArchProfile, peak_gprs: usize, max_gprs: usize, peak_vecs: usize, max_vecs: usize } => ("register spill on {}: gprs {peak_gprs}/{max_gprs}, vecs {peak_vecs}/{max_vecs}", profile.name()),
     CounterexampleFound { node: NodeId, fault: u8, inputs: Vec<i64> } => ("counterexample node {node} fault 0x{fault:02x}: {inputs:?}"),
     LintViolations { count: usize } => ("static Rust linter found {count} error(s)"),
@@ -642,9 +643,11 @@ fn check_arith_op(id: NodeId, op: IrOp, d_at: &impl Fn(NodeId) -> Domain, gctx: 
             if di.lo >= 0 && (di.hi < dl.lo || gctx.diff_ub(ov, idx, len) <= -1) { acc.proven += 1; }
             else { acc.mark(VerifyError::OutOfBounds { node: id, idx_lo: di.lo, idx_hi: di.hi, limit: dl.hi.max(0) as usize }); }
         }
-        Op::PanicIfZero(cond, _) => {
-            let rel_ok = gctx.eval_rel_bool(ov, cond, 0); if rel_ok == Some(false) { return Err(VerifyError::ExplicitPanic { node: id }); }
-            if rel_ok == Some(true) { acc.proven += 1; } else { acc.mark(VerifyError::ExplicitPanic { node: id }); }
+        Op::PanicIfZero(cond, tag) => {
+            let rel_ok = gctx.eval_rel_bool(ov, cond, 0);
+            let mk_err = || if tag == 5 { VerifyError::Utf8CharBoundary { detail: format!("node {id}: unchecked &str slice at unproven UTF-8 char boundary") } } else { VerifyError::ExplicitPanic { node: id } };
+            if rel_ok == Some(false) { return Err(mk_err()); }
+            if rel_ok == Some(true) { acc.proven += 1; } else { acc.mark(mk_err()); }
         }
         Op::Add(a, b) | Op::Sub(a, b) => if d_at(a).eval_add_sub(d_at(b), matches!(op, Op::Sub(_, _))).1 { acc.mark(VerifyError::IntOverflow { node: id }); } else { acc.proven += 1; },
         Op::Mul(a, b) => if if uf_find(gctx.uf, a) == uf_find(gctx.uf, b) { d_at(a).eval_square().1 } else { d_at(a).eval_mul(d_at(b)).1 } { acc.mark(VerifyError::IntOverflow { node: id }); } else { acc.proven += 1; },
@@ -745,6 +748,8 @@ impl Program {
                 if canon.is_pure() && !matches!(canon, Op::BoundsCheck { .. } | Op::DynBoundsCheck(_, _) | Op::PanicIfZero(_, _)) {
                     if let Some(c) = doms[uf_find(&uf, id)].is_const() { let prev = *memo.entry((None, Op::Const(c))).or_insert(id); if prev != id { uf_union(&mut uf, &mut doms, prev, id); } }
                 }
+            } else if canon.is_pure() && !matches!(canon, Op::BoundsCheck { .. } | Op::DynBoundsCheck(_, _) | Op::PanicIfZero(_, _)) {
+                if let Some(&prev) = memo.get(&(None, canon)) { uf[id] = uf_find(&uf, prev); }
             }
         }
         ((0..n).map(|i| doms[uf_find(&uf, i)]).collect(), uf)

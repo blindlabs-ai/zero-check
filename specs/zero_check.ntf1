@@ -25,6 +25,8 @@ zero_cc |> rust_fe |> ir |> egraph |> codegen |> rust_emit
 +t zero_check -> Fault.DynSliceOob
 +t zero_check -> Fault.ExplicitPanic
 +t zero_check -> Fault.AsyncAwaitHavoc
++t zero_check -> Fault.Utf8CharBoundary
++t zero_check -> Fault.LoopCursorOob
 
 # Retro-causal traps (-t)
 -t Fault.UnsafeBlock <- Guard.ForbidUnsafe
@@ -37,6 +39,8 @@ zero_cc |> rust_fe |> ir |> egraph |> codegen |> rust_emit
 -t Fault.DynSliceOob <- Guard.RelationalSliceBounds
 -t Fault.ExplicitPanic <- Guard.ZeroReachablePanic
 -t Fault.AsyncAwaitHavoc <- Guard.AwaitMutHavocAndPollPoc
+-t Fault.Utf8CharBoundary <- Guard.CharBoundaryAndAsciiProof
+-t Fault.LoopCursorOob <- Guard.BoundedLoopAndStructCursor
 
 # Symmetric airlock fixed-points (0t)
 0t zero_cc >< zero_check

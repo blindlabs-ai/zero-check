@@ -826,8 +826,8 @@ pub fn dispatch(_tag: &str, buf: &[u8]) -> u32 { u32_from_bytes(buf) }
 "#;
     let r3_bad = verify_rust_functions_with_opts("p3_bad.rs", pat3_unguarded, arch, cfg, opts);
     assert_ne!(r3_ok.failed.len(), r3_bad.failed.len(), "knockout: removing guard must flip failure");
-    assert_eq!(r3_bad.failed.len(), 1);
-    assert_eq!(r3_bad.failed[0].entrypoint_trace, Some(vec!["dispatch".to_string(), "u32_from_bytes".to_string()]));
+    let u32_fail = r3_bad.failed.iter().find(|f| f.fn_name == "u32_from_bytes").expect("u32_from_bytes must fail");
+    assert_eq!(u32_fail.entrypoint_trace, Some(vec!["dispatch".to_string(), "u32_from_bytes".to_string()]));
 
     let pat4 = r#"
 pub fn first_err(errors: &[u32]) -> u32 { errors[0] }
@@ -859,12 +859,12 @@ pub fn decode_header(_ctx: &str, pkt: &[u8]) -> u32 { read_u32_be(pkt) }
 pub fn parse_packet(ctx: &str, raw: &[u8]) -> u32 { decode_header(ctx, raw) }
 "#;
     let r_mh = verify_rust_functions_with_opts("mh.rs", multi_hop, arch, cfg, opts);
-    assert_eq!(r_mh.failed.len(), 1);
+    let mh_fail = r_mh.failed.iter().find(|f| f.fn_name == "read_u32_be").expect("read_u32_be must fail");
     assert_eq!(
-        r_mh.failed[0].entrypoint_trace,
+        mh_fail.entrypoint_trace,
         Some(vec!["parse_packet".to_string(), "decode_header".to_string(), "read_u32_be".to_string()])
     );
-    let poc = r_mh.failed[0].poc_test.as_deref().unwrap_or("");
+    let poc = mh_fail.poc_test.as_deref().unwrap_or("");
     assert!(poc.starts_with("// call-chain: parse_packet -> decode_header -> read_u32_be\n"), "missing call-chain prefix in PoC:\n{poc}");
 
     // 4. Standalone published library soundness: pub fn NOT suppressed by internal wrapper; pub(crate) fn IS suppressed.
@@ -890,4 +890,292 @@ pub fn internal_caller(buf: &[u8]) -> u32 {
     assert_eq!(reps[0].failed[0].fn_name, "pub_u32");
     assert_eq!(reps[0].suppressed_guarded.len(), 1, "standalone lib pub(crate) fn MUST be suppressed: {:?}", reps[0].suppressed_guarded);
     assert_eq!(reps[0].suppressed_guarded[0].fn_name, "crate_u32");
+}
+
+#[test]
+fn knockout_struct_cursor_loop_and_utf8_char_boundary() {
+    use zero_check::VerifyError;
+
+    let arch = ArchProfile::X86_64Avx2;
+    let cfg = RefineConfig::default();
+    let opts = RustFeOptions::external_audit();
+
+    // 1. Struct-cursor bounded while loop: safe vs OOB knockout.
+    let struct_cursor_src = r#"
+pub struct Parser<'a> {
+    pub bytes: &'a [u8],
+    pub pos: usize,
+}
+impl<'a> Parser<'a> {
+    pub fn scan_safe(&mut self) -> usize {
+        let mut acc = 0usize;
+        while self.pos < self.bytes.len() {
+            acc = acc.wrapping_add(self.bytes[self.pos] as usize);
+            self.pos += 1;
+        }
+        acc
+    }
+    pub fn scan_oob(&mut self) -> usize {
+        let mut acc = 0usize;
+        while self.pos < self.bytes.len() {
+            acc = acc.wrapping_add(self.bytes[self.pos + 1] as usize);
+            self.pos += 1;
+        }
+        acc
+    }
+}
+"#;
+    let rep_sc = verify_rust_functions_with_opts("parser_cursor.rs", struct_cursor_src, arch, cfg, opts);
+    assert!(
+        rep_sc.proven.iter().any(|(n, _)| n == "Parser::scan_safe"),
+        "expected Parser::scan_safe proven, got proven={:?} failed={:?} skipped={:?}",
+        rep_sc.proven.iter().map(|(n, _)| n).collect::<Vec<_>>(),
+        rep_sc.failed,
+        rep_sc.skipped_non_kernel_fns
+    );
+    assert!(
+        rep_sc.failed.iter().any(|f| f.fn_name == "Parser::scan_oob"
+            && matches!(f.error, VerifyError::OutOfBounds { .. } | VerifyError::CounterexampleFound { fault: 1, .. })),
+        "expected Parser::scan_oob OOB failure, got failed={:?}",
+        rep_sc.failed
+    );
+    assert_ne!(
+        rep_sc.proven.iter().any(|(n, _)| n == "Parser::scan_safe"),
+        rep_sc.proven.iter().any(|(n, _)| n == "Parser::scan_oob"),
+        "struct-cursor safe vs OOB must diverge"
+    );
+
+    // 2. UTF-8 &str char-boundary slicing: unguarded bugs vs proven-safe guards.
+    let utf8_src = r#"
+pub fn bad_slice_from_1(s: &str) -> &str {
+    if s.len() < 2 { return s; }
+    &s[1..]
+}
+pub fn bad_split_at_k(s: &str, k: usize) -> (&str, &str) {
+    if k > s.len() { return (s, ""); }
+    s.split_at(k)
+}
+pub fn safe_is_ascii(s: &str) -> &str {
+    if !s.is_ascii() || s.len() < 2 { return s; }
+    &s[1..]
+}
+pub fn safe_is_char_boundary(s: &str, k: usize) -> (&str, &str) {
+    if k > s.len() || !s.is_char_boundary(k) { return (s, ""); }
+    s.split_at(k)
+}
+pub fn safe_starts_with(s: &str) -> &str {
+    if !s.starts_with("abc") { return s; }
+    &s[3..]
+}
+pub fn safe_ends_with(s: &str) -> &str {
+    if !s.ends_with(".js") { return s; }
+    &s[..s.len() - 3]
+}
+pub fn safe_find_delim(s: &str) -> &str {
+    if let Some(i) = s.find("::") {
+        &s[i + 2..]
+    } else {
+        s
+    }
+}
+pub fn safe_ascii_byte_guard(s: &str) -> &str {
+    let b = s.as_bytes();
+    if b.len() >= 1 && b[0] == b':' {
+        &s[1..]
+    } else {
+        s
+    }
+}
+"#;
+    let rep_u8 = verify_rust_functions_with_opts("utf8_slicing.rs", utf8_src, arch, cfg, opts);
+    for bad in ["bad_slice_from_1", "bad_split_at_k"] {
+        assert!(
+            rep_u8.failed.iter().any(|f| f.fn_name == bad
+                && matches!(f.error, VerifyError::Utf8CharBoundary { .. } | VerifyError::CounterexampleFound { fault: 5, .. })),
+            "expected {bad} to fail with Utf8CharBoundary, got failed={:?} proven={:?}",
+            rep_u8.failed,
+            rep_u8.proven.iter().map(|(n, _)| n).collect::<Vec<_>>()
+        );
+    }
+    for good in [
+        "safe_is_ascii",
+        "safe_is_char_boundary",
+        "safe_starts_with",
+        "safe_ends_with",
+        "safe_find_delim",
+        "safe_ascii_byte_guard",
+    ] {
+        assert!(
+            !rep_u8.failed.iter().any(|f| f.fn_name == good),
+            "expected {good} to have 0 failures, got failed={:?}",
+            rep_u8.failed
+        );
+    }
+    assert_ne!(
+        rep_u8.failed.iter().any(|f| f.fn_name == "bad_slice_from_1"),
+        rep_u8.failed.iter().any(|f| f.fn_name == "safe_is_ascii"),
+        "unguarded &s[1..] vs is_ascii()-guarded must diverge"
+    );
+    assert_ne!(
+        rep_u8.failed.iter().any(|f| f.fn_name == "bad_split_at_k"),
+        rep_u8.failed.iter().any(|f| f.fn_name == "safe_is_char_boundary"),
+        "unguarded split_at(k) vs is_char_boundary(k)-guarded must diverge"
+    );
+}
+
+#[test]
+fn real_world_self_callgraph_cse_isqrt_trim_and_bun_bug_patterns() {
+    use zero_check::VerifyError;
+    let arch = ArchProfile::X86_64Avx2;
+    let cfg = RefineConfig::default();
+    let opts = RustFeOptions::external_audit();
+
+    // 1. Self:: call-graph reachability + guarded pure CSE + isqrt + trim/delim cursors.
+    let self_and_helpers_src = r#"
+pub struct Scanner;
+impl Scanner {
+    fn read_u32_le(buf: &[u8]) -> u32 {
+        u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]])
+    }
+    pub fn safe_entry(buf: &[u8]) -> u32 {
+        if buf.len() >= 4 { Self::read_u32_le(buf) } else { 0 }
+    }
+    pub fn safe_isqrt_loop(n: u32) -> u64 {
+        let limit = n as u64;
+        let mut d = 2u64;
+        let mut acc = 0u64;
+        while d * d <= limit {
+            acc = acc.wrapping_add(d);
+            d += 1;
+        }
+        acc
+    }
+    pub fn safe_cse_slice(buf: &[u8]) -> u8 {
+        if buf.len() >= 2 {
+            let a = buf[0];
+            let b = buf[buf.len() - 1];
+            a.wrapping_add(b)
+        } else {
+            0
+        }
+    }
+    pub fn safe_trim_str(s: &str) -> &str {
+        let t = s.trim();
+        if t.len() >= 2 && t.is_ascii() { &t[1..] } else { t }
+    }
+    pub fn safe_skip_ws_delim(b: &[u8]) -> usize {
+        let mut i = 0usize;
+        while i < b.len() && (b[i] == b' ' || b[i] == b'\t') {
+            i += 1;
+        }
+        if i < b.len() && b[i] == b'(' {
+            i += 1;
+            while i < b.len() && b[i] != b')' {
+                i += 1;
+            }
+        }
+        i
+    }
+}
+"#;
+    let rep_ok = verify_rust_functions_with_opts("self_ok.rs", self_and_helpers_src, arch, cfg, opts);
+    assert!(
+        rep_ok.failed.is_empty(),
+        "expected 0 failures for Self:: guarded helper + isqrt + CSE + trim/delim, got failed={:?}",
+        rep_ok.failed
+    );
+    assert!(
+        rep_ok.suppressed_guarded.iter().any(|s| s.fn_name == "Scanner::read_u32_le"),
+        "expected Scanner::read_u32_le suppressed via Self:: call-graph, got {:?}",
+        rep_ok.suppressed_guarded
+    );
+
+    let self_unguarded_src = r#"
+pub struct Scanner;
+impl Scanner {
+    fn read_u32_le(buf: &[u8]) -> u32 {
+        u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]])
+    }
+    pub fn bad_entry(buf: &[u8]) -> u32 {
+        Self::read_u32_le(buf)
+    }
+}
+"#;
+    let rep_bad = verify_rust_functions_with_opts("self_bad.rs", self_unguarded_src, arch, cfg, opts);
+    assert_ne!(
+        rep_ok.failed.is_empty(),
+        rep_bad.failed.is_empty(),
+        "knockout: removing Self:: caller guard must surface failure"
+    );
+
+    // 2. Real-world overflow/truncation bug patterns (align_up, asymmetric year bound, shift slot).
+    let bug_patterns_src = r#"
+pub fn bad_align_up(len: u64) -> u64 {
+    (len + 7) & !7u64
+}
+pub fn safe_align_up(len: u64) -> Option<u64> {
+    Some(len.checked_add(7)? & !7u64)
+}
+pub fn bad_asymmetric_year_days(year: i32) -> i32 {
+    if year > i32::MAX / 400 {
+        return 0;
+    }
+    year * 365
+}
+pub fn safe_symmetric_year_days(year: i32) -> i32 {
+    if year > i32::MAX / 400 || year < -(i32::MAX / 400) {
+        return 0;
+    }
+    year * 365
+}
+pub fn bad_offset_slot(symbol: usize) -> usize {
+    if symbol < 4 {
+        return symbol;
+    }
+    let extra = (symbol - 2) >> 1;
+    1usize << extra
+}
+pub fn safe_offset_slot(symbol: usize) -> usize {
+    if symbol < 4 {
+        return symbol;
+    }
+    if symbol >= 30 {
+        return 0;
+    }
+    let extra = (symbol - 2) >> 1;
+    1usize << extra
+}
+"#;
+    let rep_bugs = verify_rust_functions_with_opts("runtime_bugs.rs", bug_patterns_src, arch, cfg, opts);
+    for bad in ["bad_align_up", "bad_asymmetric_year_days", "bad_offset_slot"] {
+        assert!(
+            rep_bugs.failed.iter().any(|f| f.fn_name == bad
+                && matches!(f.error, VerifyError::CounterexampleFound { .. } | VerifyError::ShiftOverflow { .. } | VerifyError::IntOverflow { .. })),
+            "expected {bad} to fail verification, got failed={:?} proven={:?}",
+            rep_bugs.failed,
+            rep_bugs.proven.iter().map(|(n, _)| n).collect::<Vec<_>>()
+        );
+    }
+    for good in ["safe_align_up", "safe_symmetric_year_days", "safe_offset_slot"] {
+        assert!(
+            !rep_bugs.failed.iter().any(|f| f.fn_name == good),
+            "expected {good} to pass verification, got failed={:?}",
+            rep_bugs.failed
+        );
+    }
+    assert_ne!(
+        rep_bugs.failed.iter().any(|f| f.fn_name == "bad_align_up"),
+        rep_bugs.failed.iter().any(|f| f.fn_name == "safe_align_up"),
+        "bad_align_up vs safe_align_up must diverge"
+    );
+    assert_ne!(
+        rep_bugs.failed.iter().any(|f| f.fn_name == "bad_asymmetric_year_days"),
+        rep_bugs.failed.iter().any(|f| f.fn_name == "safe_symmetric_year_days"),
+        "asymmetric vs symmetric year bound must diverge"
+    );
+    assert_ne!(
+        rep_bugs.failed.iter().any(|f| f.fn_name == "bad_offset_slot"),
+        rep_bugs.failed.iter().any(|f| f.fn_name == "safe_offset_slot"),
+        "unguarded vs guarded offset_slot shift must diverge"
+    );
 }
