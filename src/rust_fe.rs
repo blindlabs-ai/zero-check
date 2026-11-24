@@ -87,12 +87,12 @@ fn tokenize_rust(src: &str) -> Vec<Tok> {
     while i < n {
         let c0 = b.get(i).copied().unwrap_or(0);
         if c0.is_ascii_whitespace() { i += 1; continue; }
-        let rest = &src[i..];
-        if rest.starts_with("///") { let s = i + 3; while i < n && b.get(i) != Some(&b'\n') { i += 1; } out.push(Tok::Doc(src[s..i].trim().to_string())); }
-        else if rest.starts_with("//") { while i < n && b.get(i) != Some(&b'\n') { i += 1; } }
-        else if rest.starts_with("/*") {
+        let rest = &b[i..];
+        if rest.starts_with(b"///") { let s = i + 3; while i < n && b.get(i) != Some(&b'\n') { i += 1; } out.push(Tok::Doc(src[s..i].trim().to_string())); }
+        else if rest.starts_with(b"//") { while i < n && b.get(i) != Some(&b'\n') { i += 1; } }
+        else if rest.starts_with(b"/*") {
             let mut d = 1usize; i += 2;
-            while i < n && d > 0 { if src[i..].starts_with("/*") { d += 1; i += 2; } else if src[i..].starts_with("*/") { d -= 1; i += 2; } else { i += 1; } }
+            while i < n && d > 0 { if b[i..].starts_with(b"/*") { d += 1; i += 2; } else if b[i..].starts_with(b"*/") { d -= 1; i += 2; } else { i += 1; } }
         } else if c0 == b'b' && b.get(i + 1) == Some(&b'\'') {
             if let Some(t) = parse_byte_lit(b, &mut i) { out.push(t); } else { skip_quoted(b, &mut i, b'\''); out.push(Tok::Sym("@")); }
         } else if c0 == b'b' && b.get(i + 1) == Some(&b'"') { i += 1; skip_quoted(b, &mut i, b'"'); out.push(Tok::Sym("\"")); }
@@ -116,7 +116,7 @@ fn tokenize_rust(src: &str) -> Vec<Tok> {
             if b.get(i) == Some(&b'.') && b.get(i + 1).is_some_and(u8::is_ascii_digit) {
                 i += 1; while i < n && b.get(i).is_some_and(|c| c.is_ascii_alphanumeric() || *c == b'_') { i += 1; } out.push(Tok::Sym("@"));
             } else { out.push(parse_int_tok(&src[s..i]).map_or(Tok::Sym("@"), |(v, ty)| Tok::Int(v, ty))); }
-        } else if let Some(&s) = MULTI.iter().find(|&&m| rest.starts_with(m)) { out.push(Tok::Sym(s)); i += s.len(); }
+        } else if let Some(&s) = MULTI.iter().find(|&&m| rest.starts_with(m.as_bytes())) { out.push(Tok::Sym(s)); i += s.len(); }
         else { out.push(Tok::Sym(SINGLE.iter().copied().find(|s| s.as_bytes().first() == Some(&c0)).unwrap_or("@"))); i += 1; }
     }
     out

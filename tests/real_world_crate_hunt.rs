@@ -736,3 +736,35 @@ pub fn bad_shift(x: u64, s: u32) -> u64 { x << s }
     assert_ne!(rep_ok.failed.len(), rep_bad.failed.len());
     assert_eq!(rep_bad.failed.len(), 3, "all 3 unguarded counterfactuals must fail: {:?}", rep_bad.failed);
 }
+
+#[test]
+fn tokenize_multibyte_utf8_comments_no_panic_knockout() {
+    let ok_src = concat!(
+        "/* block comment with em-dash \u{2014}, arrow \u{2192}, and CJK \u{4e2d} */\n",
+        "// line comment \u{2014} end\n",
+        "/// doc comment \u{2014} note\n",
+        "pub fn ok(x: u8) -> u16 { (x as u16) + 1 }\n",
+    );
+    let bad_src = concat!(
+        "/* nested /* block \u{2014} */ comment \u{2192} before bug */\n",
+        "pub fn bad(x: u32, d: u32) -> u32 { x / d }\n",
+    );
+    let rep_ok = verify_rust_functions_with_opts(
+        "utf8_ok.rs",
+        ok_src,
+        ArchProfile::X86_64Avx2,
+        RefineConfig::default(),
+        RustFeOptions::external_audit(),
+    );
+    let rep_bad = verify_rust_functions_with_opts(
+        "utf8_bad.rs",
+        bad_src,
+        ArchProfile::X86_64Avx2,
+        RefineConfig::default(),
+        RustFeOptions::external_audit(),
+    );
+    assert_eq!(rep_ok.failed.len(), 0, "UTF-8 comments must not panic or fail: {:?}", rep_ok.failed);
+    assert_eq!(rep_ok.proven.len(), 1, "expected ok() proven: {:?}", rep_ok.proven);
+    assert_ne!(rep_ok.failed.len(), rep_bad.failed.len(), "knockout: bad() after UTF-8 comment must fail");
+    assert_eq!(rep_bad.failed.len(), 1, "expected DivZero failure in bad(): {:?}", rep_bad.failed);
+}
