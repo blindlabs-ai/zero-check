@@ -8,6 +8,8 @@ zero_cc |> rust_fe |> ir |> egraph |> codegen |> rust_emit
 # Forward morphisms (+t)
 +t rust_src |> mask_rust_source -> lint_rs
 +t rust_src |> parse_rust_programs -> abstract_eval
++t rust_src |> boundary_morphism -> witness_lattice
++t witness_lattice |> callgraph_airlock -> proof_verdict
 +t ntf1_spec |> parse_ntf1 -> emit_ntf1
 +t ir_dag |> sethi_ullman_su -> schedule_report
 +t ir_dag |> interval_congruence_egraph -> abstract_report
@@ -46,4 +48,5 @@ zero_cc |> rust_fe |> ir |> egraph |> codegen |> rust_emit
 0t zero_cc >< zero_check
 0t parse_ntf1 |> emit_ntf1 >< parse_ntf1
 0t rust_fe >< abstract_eval
+0t witness_lattice >< callgraph_airlock
 0t proof_verdict >< rust_poc_test

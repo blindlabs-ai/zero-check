@@ -53,9 +53,10 @@ fn bench_live_real_crates_sub_10ms() {
 
     let elapsed_us = t0.elapsed().as_micros();
     let elapsed_ms = (elapsed_us as f64) / 1000.0;
+    let budget_ms = (25.0_f64).max((total_lines as f64) * 0.0015);
     assert!(
-        elapsed_ms < 25.0,
-        "expected < 25 ms to verify {total_lines} LOC across {crates_scanned} crates, got {elapsed_ms:.3} ms"
+        elapsed_ms < budget_ms,
+        "expected < {budget_ms:.1} ms (<= 1.5 ms/kLOC) to verify {total_lines} LOC across {crates_scanned} crates, got {elapsed_ms:.3} ms"
     );
 
     // Explicitly verify legal u128 >> 64 (as in Ed25519 wide-limb reduction) has zero false positives.

@@ -7,15 +7,12 @@ macro_rules! define_errors {
         impl std::error::Error for $name {}
     }; (@parse $vis:vis $name:ident $f:ident $v:tt $a:tt) => { $crate::define_errors!(@build $vis $name $f $v $a); };
     (@parse $vis:vis $name:ident $f:ident [$($v:tt)*] [$($a:tt)*] $var:ident ( $($tf:ident : $tt:ty),+ ) => ($fmt:expr $(, $arg:expr)*) $(, $($rest:tt)*)?) => {
-        $crate::define_errors!(@parse $vis $name $f [$($v)* $var($($tt),+),] [$($a)* Self::$var($($tf),+) => write!($f, $fmt $(, $arg)*),] $($($rest)*)?);
-    };
+        $crate::define_errors!(@parse $vis $name $f [$($v)* $var($($tt),+),] [$($a)* Self::$var($($tf),+) => write!($f, $fmt $(, $arg)*),] $($($rest)*)?); };
     (@parse $vis:vis $name:ident $f:ident [$($v:tt)*] [$($a:tt)*] $var:ident { $($sf:ident : $st:ty),+ } => ($fmt:expr $(, $arg:expr)*) $(, $($rest:tt)*)?) => {
-        $crate::define_errors!(@parse $vis $name $f [$($v)* $var { $($sf : $st),+ },] [$($a)* Self::$var { $($sf),+ } => write!($f, $fmt $(, $arg)*),] $($($rest)*)?);
-    };
+        $crate::define_errors!(@parse $vis $name $f [$($v)* $var { $($sf : $st),+ },] [$($a)* Self::$var { $($sf),+ } => write!($f, $fmt $(, $arg)*),] $($($rest)*)?); };
     (@parse $vis:vis $name:ident $f:ident [$($v:tt)*] [$($a:tt)*] $var:ident => ($fmt:expr $(, $arg:expr)*) $(, $($rest:tt)*)?) => {
         $crate::define_errors!(@parse $vis $name $f [$($v)* $var,] [$($a)* Self::$var => write!($f, $fmt $(, $arg)*),] $($($rest)*)?);
-    }; ($vis:vis $name:ident { $($rest:tt)* }) => { $crate::define_errors!(@parse $vis $name f [] [] $($rest)*); };
-}
+    }; ($vis:vis $name:ident { $($rest:tt)* }) => { $crate::define_errors!(@parse $vis $name f [] [] $($rest)*); }; }
 macro_rules! define_ops {
     (@build $d:ident $f:ident [$($v:tt)*] [$($i:pat),*] [$($k:tt)*] [$($m:tt)*]) => {
         #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -23,42 +20,30 @@ macro_rules! define_ops {
         impl<Id: Copy> Op<Id> {
             #[must_use] pub const fn is_pure(self) -> bool { !matches!(self, $($i)|*) }
             #[must_use] pub fn children(self) -> ([Id; 3], usize) where Id: Default {
-                let $d = Id::default(); match self { $($k)* }
-            }
-            pub fn map_ids<Out>(self, mut $f: impl FnMut(Id) -> Out) -> Op<Out> { match self { $($m)* } }
-        }
+                let $d = Id::default(); match self { $($k)* } }
+            pub fn map_ids<Out>(self, mut $f: impl FnMut(Id) -> Out) -> Op<Out> { match self { $($m)* } } }
     }; (@parse $d:ident $f:ident $v:tt $i:tt $k:tt $m:tt) => { $crate::define_ops!(@build $d $f $v $i $k $m); };
     (@parse $d:ident $f:ident [$($v:tt)*] [$($i:pat),*] [$($k:tt)*] [$($m:tt)*] @0 pure $n:ident($t:ty), $($r:tt)*) => {
-        $crate::define_ops!(@parse $d $f [$($v)* $n($t),] [$($i),*] [$($k)* Self::$n(_) => ([$d, $d, $d], 0),] [$($m)* Self::$n(x) => Op::$n(x),] $($r)*);
-    };
+        $crate::define_ops!(@parse $d $f [$($v)* $n($t),] [$($i),*] [$($k)* Self::$n(_) => ([$d, $d, $d], 0),] [$($m)* Self::$n(x) => Op::$n(x),] $($r)*); };
     (@parse $d:ident $f:ident [$($v:tt)*] [$($i:pat),*] [$($k:tt)*] [$($m:tt)*] @0 eff $n:ident($t:ty), $($r:tt)*) => {
-        $crate::define_ops!(@parse $d $f [$($v)* $n($t),] [$($i,)* Self::$n(_)] [$($k)* Self::$n(_) => ([$d, $d, $d], 0),] [$($m)* Self::$n(x) => Op::$n(x),] $($r)*);
-    };
+        $crate::define_ops!(@parse $d $f [$($v)* $n($t),] [$($i,)* Self::$n(_)] [$($k)* Self::$n(_) => ([$d, $d, $d], 0),] [$($m)* Self::$n(x) => Op::$n(x),] $($r)*); };
     (@parse $d:ident $f:ident [$($v:tt)*] [$($i:pat),*] [$($k:tt)*] [$($m:tt)*] @0s eff $n:ident { $a:ident : $at:ty, $b:ident : $bt:ty }, $($r:tt)*) => {
-        $crate::define_ops!(@parse $d $f [$($v)* $n { $a: $at, $b: $bt },] [$($i,)* Self::$n { .. }] [$($k)* Self::$n { .. } => ([$d, $d, $d], 0),] [$($m)* Self::$n { $a, $b } => Op::$n { $a, $b },] $($r)*);
-    };
+        $crate::define_ops!(@parse $d $f [$($v)* $n { $a: $at, $b: $bt },] [$($i,)* Self::$n { .. }] [$($k)* Self::$n { .. } => ([$d, $d, $d], 0),] [$($m)* Self::$n { $a, $b } => Op::$n { $a, $b },] $($r)*); };
     (@parse $d:ident $f:ident [$($v:tt)*] [$($i:pat),*] [$($k:tt)*] [$($m:tt)*] @1s eff $n:ident { $x:ident : $xt:ty, $id:ident : Id }, $($r:tt)*) => {
-        $crate::define_ops!(@parse $d $f [$($v)* $n { $x: $xt, $id: Id },] [$($i,)* Self::$n { .. }] [$($k)* Self::$n { $id, .. } => ([$id, $d, $d], 1),] [$($m)* Self::$n { $x, $id } => Op::$n { $x, $id: $f($id) },] $($r)*);
-    };
+        $crate::define_ops!(@parse $d $f [$($v)* $n { $x: $xt, $id: Id },] [$($i,)* Self::$n { .. }] [$($k)* Self::$n { $id, .. } => ([$id, $d, $d], 1),] [$($m)* Self::$n { $x, $id } => Op::$n { $x, $id: $f($id) },] $($r)*); };
     (@parse $d:ident $f:ident [$($v:tt)*] [$($i:pat),*] [$($k:tt)*] [$($m:tt)*] @1s pure $n:ident { $id:ident : Id, $x:ident : $xt:ty }, $($r:tt)*) => {
-        $crate::define_ops!(@parse $d $f [$($v)* $n { $id: Id, $x: $xt },] [$($i),*] [$($k)* Self::$n { $id, .. } => ([$id, $d, $d], 1),] [$($m)* Self::$n { $id, $x } => Op::$n { $id: $f($id), $x },] $($r)*);
-    };
+        $crate::define_ops!(@parse $d $f [$($v)* $n { $id: Id, $x: $xt },] [$($i),*] [$($k)* Self::$n { $id, .. } => ([$id, $d, $d], 1),] [$($m)* Self::$n { $id, $x } => Op::$n { $id: $f($id), $x },] $($r)*); };
     (@parse $d:ident $f:ident [$($v:tt)*] [$($i:pat),*] [$($k:tt)*] [$($m:tt)*] @1t pure $n:ident(Id, $t:ty), $($r:tt)*) => {
-        $crate::define_ops!(@parse $d $f [$($v)* $n(Id, $t),] [$($i),*] [$($k)* Self::$n(a, _) => ([a, $d, $d], 1),] [$($m)* Self::$n(a, s) => Op::$n($f(a), s),] $($r)*);
-    };
+        $crate::define_ops!(@parse $d $f [$($v)* $n(Id, $t),] [$($i),*] [$($k)* Self::$n(a, _) => ([a, $d, $d], 1),] [$($m)* Self::$n(a, s) => Op::$n($f(a), s),] $($r)*); };
     (@parse $d:ident $f:ident [$($v:tt)*] [$($i:pat),*] [$($k:tt)*] [$($m:tt)*] @2 pure $n:ident(Id, Id), $($r:tt)*) => {
-        $crate::define_ops!(@parse $d $f [$($v)* $n(Id, Id),] [$($i),*] [$($k)* Self::$n(a, b) => ([a, b, $d], 2),] [$($m)* Self::$n(a, b) => Op::$n($f(a), $f(b)),] $($r)*);
-    };
+        $crate::define_ops!(@parse $d $f [$($v)* $n(Id, Id),] [$($i),*] [$($k)* Self::$n(a, b) => ([a, b, $d], 2),] [$($m)* Self::$n(a, b) => Op::$n($f(a), $f(b)),] $($r)*); };
     (@parse $d:ident $f:ident [$($v:tt)*] [$($i:pat),*] [$($k:tt)*] [$($m:tt)*] @2k pure $n:ident($kty:ty, Id, Id), $($r:tt)*) => {
-        $crate::define_ops!(@parse $d $f [$($v)* $n($kty, Id, Id),] [$($i),*] [$($k)* Self::$n(_, a, b) => ([a, b, $d], 2),] [$($m)* Self::$n(k, a, b) => Op::$n(k, $f(a), $f(b)),] $($r)*);
-    };
+        $crate::define_ops!(@parse $d $f [$($v)* $n($kty, Id, Id),] [$($i),*] [$($k)* Self::$n(_, a, b) => ([a, b, $d], 2),] [$($m)* Self::$n(k, a, b) => Op::$n(k, $f(a), $f(b)),] $($r)*); };
     (@parse $d:ident $f:ident [$($v:tt)*] [$($i:pat),*] [$($k:tt)*] [$($m:tt)*] @2s eff $n:ident { $x:ident : $xt:ty, $a:ident : Id, $b:ident : Id }, $($r:tt)*) => {
-        $crate::define_ops!(@parse $d $f [$($v)* $n { $x: $xt, $a: Id, $b: Id },] [$($i,)* Self::$n { .. }] [$($k)* Self::$n { $a, $b, .. } => ([$a, $b, $d], 2),] [$($m)* Self::$n { $x, $a, $b } => Op::$n { $x, $a: $f($a), $b: $f($b) },] $($r)*);
-    };
+        $crate::define_ops!(@parse $d $f [$($v)* $n { $x: $xt, $a: Id, $b: Id },] [$($i,)* Self::$n { .. }] [$($k)* Self::$n { $a, $b, .. } => ([$a, $b, $d], 2),] [$($m)* Self::$n { $x, $a, $b } => Op::$n { $x, $a: $f($a), $b: $f($b) },] $($r)*); };
     (@parse $d:ident $f:ident [$($v:tt)*] [$($i:pat),*] [$($k:tt)*] [$($m:tt)*] @3s pure $n:ident { $a:ident : Id, $b:ident : Id, $c:ident : Id }, $($r:tt)*) => {
         $crate::define_ops!(@parse $d $f [$($v)* $n { $a: Id, $b: Id, $c: Id },] [$($i),*] [$($k)* Self::$n { $a, $b, $c } => ([$a, $b, $c], 3),] [$($m)* Self::$n { $a, $b, $c } => Op::$n { $a: $f($a), $b: $f($b), $c: $f($c) },] $($r)*);
-    }; ($($r:tt)*) => { $crate::define_ops!(@parse d f [] [] [] [] $($r)*); };
-}
+    }; ($($r:tt)*) => { $crate::define_ops!(@parse d f [] [] [] [] $($r)*); }; }
 pub(crate) use {define_errors, define_ops};
 pub mod abstract_eval; pub mod callgraph; pub mod gauntlet; pub mod lint_rs; pub mod ntf1; pub mod rust_fe; pub mod simd_fuzz;
 use std::path::Path;
@@ -81,11 +66,8 @@ pub fn verify_program(prog: &Program, profile: ArchProfile, cfg: RefineConfig) -
             match &refine.verdict {
                 ProofVerdict::Counterexample { input, node, fault, .. } => Err(VerifyError::CounterexampleFound { node: *node, fault: *fault, inputs: input.clone() }),
                 ProofVerdict::ProvenTotal { .. } => Ok(ProgramReport { verdict: refine.verdict.clone(), abstract_report, refine_report: Some(refine) }),
-                ProofVerdict::Incomplete { .. } => Err(err.clone()),
-            }
-        }
-    }
-}
+                ProofVerdict::Incomplete { .. } => Err(err.clone()), }
+        } } }
 fn require_clean(report: LintReport) -> Result<LintReport, VerifyError> { if report.is_clean() { Ok(report) } else { Err(VerifyError::LintViolations { count: report.error_count() }) } }
 pub fn verify_crate_dir(dir: &Path) -> Result<LintReport, VerifyError> { require_clean(scan_crate_dir(dir)?) }
 pub fn verify_rust_source(file: &str, src: &str) -> Result<LintReport, VerifyError> { require_clean(scan_rust_source(file, src)) }
@@ -93,11 +75,9 @@ pub fn verify_rust_source(file: &str, src: &str) -> Result<LintReport, VerifyErr
 pub fn verify_kernel_rust_source(file: &str, src: &str, profile: ArchProfile, cfg: RefineConfig) -> Result<(LintReport, RustProofReport), VerifyError> {
     let mut lint = scan_rust_source(file, src); promote_kernel_strict(&mut lint); let (lint, proofs) = (require_clean(lint)?, verify_rust_functions(file, src, profile, cfg));
     if let Some(first) = proofs.failed.first() { return Err(first.error.clone()); }
-    Ok((lint, proofs))
-}
+    Ok((lint, proofs)) }
 /// Fail-closed kernel-strict + totality gate: also rejects any skipped non-kernel functions.
 pub fn verify_kernel_rust_source_total(file: &str, src: &str, profile: ArchProfile, cfg: RefineConfig) -> Result<(LintReport, RustProofReport), VerifyError> {
     let (lint, proofs) = verify_kernel_rust_source(file, src, profile, cfg)?;
     if !proofs.skipped_non_kernel_fns.is_empty() { return Err(VerifyError::LintViolations { count: proofs.skipped_non_kernel_fns.len() }); }
-    Ok((lint, proofs))
-}
+    Ok((lint, proofs)) }

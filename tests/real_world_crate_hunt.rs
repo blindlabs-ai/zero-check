@@ -1179,3 +1179,200 @@ pub fn safe_offset_slot(symbol: usize) -> usize {
         "unguarded vs guarded offset_slot shift must diverge"
     );
 }
+
+#[test]
+fn knockout_ontology_traps_a_b_c_non_ascii_and_cross_file_airlock() {
+    use zero_check::{verify_crate_functions_with_opts, VerifyError};
+    let arch = ArchProfile::X86_64Avx2;
+    let cfg = RefineConfig::default();
+    let opts = RustFeOptions::external_audit();
+
+    let src = r#"
+pub struct Req { pub name: [u8; 8] }
+pub struct Holder<'a> { pub name: &'a str }
+
+// --- Trap A: Affine sub-slice framing in LowerCtx (lowered) and WitnessLattice (non-lowered) ---
+pub fn trap_a_lower_pass(s: &str) -> usize {
+    if let Some(p) = s.find(':') {
+        let start = p + 1;
+        let sub = &s[start..];
+        if let Some(rel) = sub.find('=') {
+            let end = start + rel;
+            if end <= s.len() { return s[..end].len(); }
+        }
+    }
+    0
+}
+pub fn trap_a_lower_fail(s: &str) -> usize {
+    if let Some(p) = s.find(':') {
+        let start = p + 1;
+        let sub = &s[start..];
+        if let Some(rel) = sub.find('=') {
+            if rel <= s.len() { return s[..rel].len(); }
+        }
+    }
+    0
+}
+pub fn trap_a_lattice_pass(s: &str) -> Option<&str> {
+    let _ = format!("{s}");
+    let start = s.find(':')? + 1;
+    let sub = &s[start..];
+    let rel = sub.find('=')?;
+    Some(&s[start..start + rel + 1])
+}
+pub fn trap_a_lattice_fail(s: &str) -> Option<&str> {
+    let _ = format!("{s}");
+    let start = s.find(':')? + 1;
+    let sub = &s[start..];
+    let rel = sub.find('=')?;
+    Some(&s[..rel])
+}
+
+// --- Trap B: BoundaryMorphism universal quantification & ASCII delimiter soundness ---
+fn bm_bad_escape(b: &[u8], i: usize) -> usize {
+    if i < b.len() && b[i] == b')' { return i; }
+    return i;
+}
+fn bm_bad_wildcard(b: &[u8], i: usize) -> usize {
+    if i >= b.len() { return b.len(); }
+    match b[i] { b')' => return i, _ => return i }
+}
+fn bm_bad_unguarded_while(b: &[u8], mut i: usize) -> usize {
+    while i < b.len() { i += 1; }
+    i
+}
+fn bm_safe_while(b: &[u8], mut i: usize) -> usize {
+    while i < b.len() && b[i].is_ascii_whitespace() { i += 1; }
+    i
+}
+fn bm_bad_non_ascii_delim(b: &[u8]) -> Option<usize> {
+    let mut i = 0;
+    while i < b.len() { if b[i] == 0xC3 { return Some(i); } i += 1; }
+    None
+}
+fn bm_find_param_delim(b: &[u8], d: u8) -> Option<usize> {
+    let mut i = 0;
+    while i < b.len() { if b[i] == d { return Some(i); } i += 1; }
+    None
+}
+pub fn trap_b_escape_fail(s: &str, i: usize) -> &str { let _ = format!("{s}"); let b = s.as_bytes(); let idx = bm_bad_escape(b, i); &s[..idx] }
+pub fn trap_b_wildcard_fail(s: &str, i: usize) -> &str { let _ = format!("{s}"); let b = s.as_bytes(); let idx = bm_bad_wildcard(b, i); &s[..idx] }
+pub fn trap_b_while_fail(s: &str, i: usize) -> &str { let _ = format!("{s}"); let b = s.as_bytes(); let idx = bm_bad_unguarded_while(b, i); &s[..idx] }
+pub fn trap_b_while_pass(s: &str) -> &str { let _ = format!("{s}"); let b = s.as_bytes(); let idx = bm_safe_while(b, 0); &s[..idx] }
+pub fn trap_b_non_ascii_delim_fail(s: &str) -> Option<&str> { let _ = format!("{s}"); let b = s.as_bytes(); let idx = bm_bad_non_ascii_delim(b)?; Some(&s[..idx]) }
+pub fn trap_b_param_delim_fail(s: &str, d: u8) -> Option<&str> { let _ = format!("{s}"); let b = s.as_bytes(); let idx = bm_find_param_delim(b, d)?; Some(&s[..idx]) }
+pub fn trap_b_param_delim_pass(s: &str) -> Option<&str> { let _ = format!("{s}"); let b = s.as_bytes(); let idx = bm_find_param_delim(b, b')')?; Some(&s[..idx]) }
+
+// --- Trap C: De Morgan branch law, sequential shadowing, and field disambiguation ---
+pub fn trap_c_demorgan_or_pass(s: &str) -> &str {
+    let _ = format!("{s}");
+    if !s.is_ascii() || s.len() < 2 { return s; }
+    &s[1..]
+}
+pub fn trap_c_demorgan_and_fail(s: &str) -> &str {
+    let _ = format!("{s}");
+    if !s.is_ascii() && s.len() < 2 { return s; }
+    &s[1..]
+}
+pub fn trap_c_shadow_before_fail(b: &str) -> &[u8] {
+    let _ = format!("{b}");
+    let _bad = &b[0..3];
+    let b = b.as_bytes();
+    &b[..1]
+}
+pub fn trap_c_shadow_after_pass(b: &str) -> &[u8] {
+    let _ = format!("{b}");
+    if b.len() < 4 { return b.as_bytes(); }
+    let b = b.as_bytes();
+    &b[..1]
+}
+pub fn trap_c_other_field_pass(name: &str, request: &Req) -> &[u8] {
+    let _ = format!("{name}");
+    let _n = name.len();
+    &request.name[0..3]
+}
+impl<'a> Holder<'a> {
+    pub fn trap_c_self_field_fail(&self) -> &str { let _ = format!("{}", self.name); &self.name[0..3] }
+}
+
+// --- Non-ASCII char literal '\u{1F600}' vs ASCII ')' ---
+pub fn trap_non_ascii_char_fail(s: &str) -> Option<&str> {
+    let _ = format!("{s}");
+    let idx = s.find('\u{1F600}')? + 1;
+    Some(&s[idx..])
+}
+pub fn trap_ascii_char_pass(s: &str) -> Option<&str> {
+    let _ = format!("{s}");
+    let idx = s.find(')')? + 1;
+    Some(&s[idx..])
+}
+"#;
+    let rep = verify_rust_functions_with_opts("ontology_traps.rs", src, arch, cfg, opts);
+    assert!(
+        rep.proven.iter().any(|(n, _)| n == "trap_a_lower_pass"),
+        "Trap A LowerCtx: expected `trap_a_lower_pass` to be formally PROVEN, failed={:?}",
+        rep.failed
+    );
+    let lower_fail_hit = rep.failed.iter().any(|f| f.fn_name == "trap_a_lower_fail");
+    assert!(lower_fail_hit, "Trap A LowerCtx: expected `trap_a_lower_fail` to FAIL, failed={:?}", rep.failed);
+    assert_ne!(
+        rep.failed.iter().any(|f| f.fn_name == "trap_a_lower_pass"),
+        lower_fail_hit,
+        "Trap A LowerCtx: pass/fail counterfactual must diverge"
+    );
+    let failed = |name: &str| rep.failed.iter().any(|f| f.fn_name == name && matches!(f.error, VerifyError::Utf8CharBoundary { .. }));
+    let pairs = [
+        ("trap_a_lattice_pass", "trap_a_lattice_fail", "Trap A WitnessLattice affine sub-slice"),
+        ("trap_b_while_pass", "trap_b_escape_fail", "Trap B unguarded escape return"),
+        ("trap_b_while_pass", "trap_b_wildcard_fail", "Trap B wildcard _ match arm"),
+        ("trap_b_while_pass", "trap_b_while_fail", "Trap B unguarded while i += 1"),
+        ("trap_b_param_delim_pass", "trap_b_non_ascii_delim_fail", "Trap B 0xC3 non-ASCII delim"),
+        ("trap_b_param_delim_pass", "trap_b_param_delim_fail", "Trap B unconstrained u8 delim"),
+        ("trap_c_demorgan_or_pass", "trap_c_demorgan_and_fail", "Trap C De Morgan || vs && branch law"),
+        ("trap_c_shadow_after_pass", "trap_c_shadow_before_fail", "Trap C sequential let b = b.as_bytes() shadowing"),
+        ("trap_c_other_field_pass", "Holder::trap_c_self_field_fail", "Trap C request.name vs self.name disambiguation"),
+        ("trap_ascii_char_pass", "trap_non_ascii_char_fail", "Non-ASCII char lit '\\u{1F600}' + 1 vs ')' + 1"),
+    ];
+    for (pass_fn, fail_fn, label) in pairs {
+        assert!(!failed(pass_fn), "{label}: expected `{pass_fn}` to PASS, got failed={:?}", rep.failed);
+        assert!(failed(fail_fn), "{label}: expected `{fail_fn}` to FAIL Utf8CharBoundary, got failed={:?}", rep.failed);
+        assert_ne!(failed(pass_fn), failed(fail_fn), "{label}: pass/fail counterfactual must diverge");
+    }
+
+    // --- Cross-file 0t UTF-8 airlock knockout ---
+    let root = tmp_dir("utf8_airlock_0t");
+    let src_dir = root.join("src");
+    let _ = std::fs::create_dir_all(&src_dir);
+    std::fs::write(root.join("Cargo.toml"), "[package]\nname = \"utf8_airlock\"\nversion = \"0.1.0\"\nedition = \"2021\"\n").unwrap();
+    std::fs::write(
+        src_dir.join("helper.rs"),
+        r#"
+pub(crate) fn safe_crate_helper(s: &str, pos: usize) -> &str { let _ = format!("{s}"); &s[pos..] }
+pub fn pub_helper_must_fail(s: &str, pos: usize) -> &str { let _ = format!("{s}"); &s[pos..] }
+pub(crate) fn unguarded_crate_helper(s: &str, pos: usize) -> &str { let _ = format!("{s}"); &s[pos..] }
+"#,
+    ).unwrap();
+    std::fs::write(
+        src_dir.join("lib.rs"),
+        r#"
+mod helper;
+pub fn guarded_entry(s: &str) -> Option<&str> {
+    let idx = s.find(':')? + 1;
+    let _ = helper::pub_helper_must_fail(s, idx);
+    Some(helper::safe_crate_helper(s, idx))
+}
+pub fn unguarded_entry(s: &str, raw_pos: usize) -> &str {
+    helper::unguarded_crate_helper(s, raw_pos)
+}
+"#,
+    ).unwrap();
+    let reps = verify_crate_functions_with_opts(&src_dir, arch, cfg, &[], opts).expect("verify cross-file utf8 airlock");
+    let _ = std::fs::remove_dir_all(&root);
+    let any_failed = |n: &str| reps.iter().any(|r| r.failed.iter().any(|f| f.fn_name == n && matches!(f.error, VerifyError::Utf8CharBoundary { .. })));
+    let any_sup = |n: &str| reps.iter().any(|r| r.suppressed_guarded.iter().any(|s| s.fn_name == n));
+    assert!(!any_failed("safe_crate_helper") && any_sup("safe_crate_helper"), "cross-file pub(crate) helper with proven caller must discharge via 0t airlock: {reps:?}");
+    assert!(any_failed("pub_helper_must_fail") && !any_sup("pub_helper_must_fail"), "pub helper must NOT be discharged by internal caller: {reps:?}");
+    assert!(any_failed("unguarded_crate_helper") && !any_sup("unguarded_crate_helper"), "unguarded caller must NOT discharge pub(crate) helper: {reps:?}");
+    assert_ne!(any_failed("safe_crate_helper"), any_failed("pub_helper_must_fail"), "0t cross-file pub(crate) vs pub airlock must diverge");
+    assert_ne!(any_failed("safe_crate_helper"), any_failed("unguarded_crate_helper"), "0t cross-file guarded vs unguarded airlock must diverge");
+}
