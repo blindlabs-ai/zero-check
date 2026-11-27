@@ -18,6 +18,10 @@ impl LintReport {
     #[must_use] pub fn is_clean(&self) -> bool { self.error_count() == 0 }
 }
 #[inline] fn is_ident_byte(b: u8) -> bool { b.is_ascii_alphanumeric() || b == b'_' }
+#[inline] fn utf8_char_width(b: &[u8], i: usize) -> usize {
+    let Some(&b0) = b.get(i) else { return 0; };
+    let w = if b0 < 0x80 { 1 } else if (b0 & 0xE0) == 0xC0 { 2 } else if (b0 & 0xF0) == 0xE0 { 3 } else if (b0 & 0xF8) == 0xF0 { 4 } else { 0 };
+    if w > 0 && b.get(i + 1..i + w).is_some_and(|tail| tail.iter().all(|&c| (c & 0xC0) == 0x80)) { w } else { 0 } }
 /// Replace comments, string literals, raw strings, and char literals with spaces, preserving `\n`.
 fn mask_rust_source(bytes: &[u8]) -> Vec<u8> {
     let (n, mut out, mut i) = (bytes.len(), bytes.to_vec(), 0usize);
@@ -49,8 +53,13 @@ fn mask_rust_source(bytes: &[u8]) -> Vec<u8> {
                 out[i] = b' '; out[i + 1] = b' '; i += 2; if i < n && bytes[i] != b'\n' { out[i] = b' '; i += 1; }
                 while i < n && bytes[i] != b'\'' && bytes[i] != b'\n' { out[i] = b' '; i += 1; }
                 if i < n && bytes[i] == b'\'' { out[i] = b' '; i += 1; }
-            } else if i + 2 < n && bytes[i + 1] != b'\'' && bytes[i + 1] != b'\n' && bytes[i + 2] == b'\'' { out[i] = b' '; out[i + 1] = b' '; out[i + 2] = b' '; i += 3; }
-            else { i += 1; }
+            } else if i + 1 < n && bytes[i + 1] != b'\'' && bytes[i + 1] != b'\n' {
+                let w = utf8_char_width(bytes, i + 1);
+                if w > 0 && i + 1 + w < n && bytes[i + 1 + w] == b'\'' {
+                    for s in &mut out[i..=i + 1 + w] { *s = b' '; }
+                    i += w + 2;
+                } else { i += 1; }
+            } else { i += 1; }
         } else { i += 1; } }
     out }
 fn prev_non_ws(b: &[u8], mut i: usize) -> Option<(usize, u8)> { while i > 0 { i -= 1; if !b[i].is_ascii_whitespace() { return Some((i, b[i])); } } None }

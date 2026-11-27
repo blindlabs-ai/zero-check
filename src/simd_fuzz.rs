@@ -22,15 +22,19 @@ pub struct RefineReport {
 #[inline] fn splitmix64(state: &mut u64) -> u64 {
     *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15); let mut z = *state;
     z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9); z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB); z ^ (z >> 31) }
-#[inline] fn snap_domain(d: Domain, raw: i64) -> i64 {
+#[inline] fn snap_domain(raw_d: Domain, raw: i64) -> i64 {
+    let d = raw_d.canonicalize();
     let mut v = raw.max(d.lo).min(d.hi);
     if d.modulus > 1 {
-        let diff = (d.rem - v.rem_euclid(d.modulus)).rem_euclid(d.modulus);
-        if let Some(up) = v.checked_add(diff).filter(|&u| u <= d.hi) { v = up; } else if let Some(dn) = v.checked_sub(d.modulus - diff).filter(|&u| u >= d.lo) { v = dn; } }
+        let (m, r, v128) = (i128::from(d.modulus), i128::from(d.rem), i128::from(v));
+        let diff = (r - v128.rem_euclid(m)).rem_euclid(m);
+        let (up, dn) = (v128 + diff, v128 - (m - diff));
+        if up <= i128::from(d.hi) { v = up as i64; } else if dn >= i128::from(d.lo) { v = dn as i64; } }
     v }
-struct LaneCtx { faults: [u8; LANES], fnodes: [u16; LANES] }
+struct CmpObs { lhs: [i64; LANES], rhs: [i64; LANES], act: [bool; LANES] }
+struct LaneCtx { faults: [u8; LANES], fnodes: [usize; LANES] }
 impl LaneCtx {
-    #[inline] fn mark(&mut self, l: usize, id: usize, bad: bool, bit: u8) { if bad { if self.faults[l] == 0 { self.fnodes[l] = id as u16; } self.faults[l] |= bit; } }
+    #[inline] fn mark(&mut self, l: usize, id: usize, bad: bool, bit: u8) { if bad { if self.faults[l] == 0 { self.fnodes[l] = id; } self.faults[l] |= bit; } }
     fn arith(&mut self, a: [i64; LANES], b: [i64; LANES], kind: u8, id: usize, act: [bool; LANES]) -> [i64; LANES] {
         std::array::from_fn(|l| { let (v, ov) = match kind { 0 => a[l].overflowing_add(b[l]), 1 => a[l].overflowing_sub(b[l]), _ => a[l].overflowing_mul(b[l]) }; self.mark(l, id, act[l] && ov, FAULT_OVERFLOW); v }) }
     fn div(&mut self, a: [i64; LANES], b: [i64; LANES], is_rem: bool, id: usize, act: [bool; LANES]) -> [i64; LANES] {
@@ -54,11 +58,12 @@ impl LaneCtx {
             else if ix[l] < 0 || (ix[l] as usize) >= s[l].len { self.mark(l, id, true, FAULT_OOB); }
             else { let slot = ix[l] as usize; s[l].mark_init(slot); if let Some(e) = wr[l].iter_mut().find(|(k, _)| *k == slot) { e.1 = vv[l]; } else { wr[l].push((slot, vv[l])); } } }
         vv } }
-/// Branchless 8-lane SIMD-parallel evaluator catching Miri + ASan shadow-epoch faults with branch guards.
-#[must_use] pub fn eval_lanes_x8(prog: &Program, param_lanes: &[[i64; LANES]]) -> BatchEval {
+fn eval_lanes_x8_inner(prog: &Program, param_lanes: &[[i64; LANES]], mut obs: Option<&mut Vec<CmpObs>>) -> (BatchEval, [usize; LANES]) {
+    if prog.validate().is_err() || param_lanes.len() < prog.param_domains.len() {
+        return (BatchEval { faults: [FAULT_NONE; LANES], fault_nodes: [u16::MAX; LANES], outputs: Vec::new() }, [usize::MAX; LANES]); }
     let mut vals = vec![[0i64; LANES]; prog.nodes.len()]; let mut shadow: Vec<[AllocState; LANES]> = prog.bufs.iter().map(|b| [AllocState::from_buf(b); LANES]).collect();
     let mut writes: Vec<[Vec<(usize, i64)>; LANES]> = prog.bufs.iter().map(|_| std::array::from_fn(|_| Vec::new())).collect();
-    let mut ctx = LaneCtx { faults: [FAULT_NONE; LANES], fnodes: [u16::MAX; LANES] };
+    let mut ctx = LaneCtx { faults: [FAULT_NONE; LANES], fnodes: [usize::MAX; LANES] };
     for (id, &op) in prog.nodes.iter().enumerate() {
         let act: [bool; LANES] = match prog.guard_of(id) { None => [true; LANES], Some((g, pol)) => std::array::from_fn(|l| (vals[g][l] != 0) == pol) };
         vals[id] = match op {
@@ -75,18 +80,26 @@ impl LaneCtx {
             Op::Shl(a, s) => ctx.shift(vals[a], [i64::from(s); LANES], true, id, act), Op::Shr(a, s) => ctx.shift(vals[a], [i64::from(s); LANES], false, id, act),
             Op::ShlVar(a, b) => ctx.shift(vals[a], vals[b], true, id, act), Op::ShrVar(a, b) => ctx.shift(vals[a], vals[b], false, id, act),
             Op::BitAnd(a, b) => std::array::from_fn(|l| vals[a][l] & vals[b][l]), Op::BitOr(a, b) => std::array::from_fn(|l| vals[a][l] | vals[b][l]), Op::BitXor(a, b) => std::array::from_fn(|l| vals[a][l] ^ vals[b][l]),
-            Op::Cmp(k, a, b) => std::array::from_fn(|l| i64::from(k.eval(vals[a][l], vals[b][l]))),
+            Op::Cmp(k, a, b) => {
+                if let Some(ref mut log) = obs { if log.len() < 32 && act.iter().any(|&f| f) { log.push(CmpObs { lhs: vals[a], rhs: vals[b], act }); } }
+                std::array::from_fn(|l| i64::from(k.eval(vals[a][l], vals[b][l]))) }
             Op::Select { cond, t_val, f_val } => std::array::from_fn(|l| if vals[cond][l] != 0 { vals[t_val][l] } else { vals[f_val][l] }),
             Op::BoundsCheck { idx, limit } => { for (l, &iv) in vals[idx].iter().enumerate() { ctx.mark(l, id, act[l] && (iv < 0 || (iv as usize) >= limit), FAULT_OOB); } vals[idx] }
-            Op::DynBoundsCheck(idx, len) => { for l in 0..LANES { let (iv, lv) = (vals[idx][l], vals[len][l]); ctx.mark(l, id, act[l] && (iv < 0 || lv <= 0 || iv >= lv), FAULT_OOB); } vals[idx] }
+            Op::DynBoundsCheck(idx, len) => {
+                if let Some(ref mut log) = obs { if log.len() < 32 && act.iter().any(|&f| f) { log.push(CmpObs { lhs: vals[idx], rhs: vals[len], act }); } }
+                for l in 0..LANES { let (iv, lv) = (vals[idx][l], vals[len][l]); ctx.mark(l, id, act[l] && (iv < 0 || lv <= 0 || iv >= lv), FAULT_OOB); } vals[idx] }
             Op::PanicIfZero(cond, _) => { for l in 0..LANES { ctx.mark(l, id, act[l] && vals[cond][l] == 0, FAULT_PANIC); } vals[cond] }
             Op::Load { buf, idx } => ctx.load(id, act, prog.bufs[usize::from(buf)].elem_domain, &shadow[usize::from(buf)], &writes[usize::from(buf)], vals[idx]),
             Op::Store { buf, idx, val } => ctx.store(id, act, &mut shadow[usize::from(buf)], &mut writes[usize::from(buf)], vals[idx], vals[val]), }; }
-    BatchEval { faults: ctx.faults, fault_nodes: ctx.fnodes, outputs: prog.outputs.iter().map(|&o| vals[o]).collect() } }
+    let fnodes_u16 = std::array::from_fn(|l| u16::try_from(ctx.fnodes[l]).unwrap_or(u16::MAX));
+    (BatchEval { faults: ctx.faults, fault_nodes: fnodes_u16, outputs: prog.outputs.iter().map(|&o| vals[o]).collect() }, ctx.fnodes) }
+/// Branchless 8-lane SIMD-parallel evaluator catching Miri + ASan shadow-epoch faults with branch guards.
+#[must_use] pub fn eval_lanes_x8(prog: &Program, param_lanes: &[[i64; LANES]]) -> BatchEval { eval_lanes_x8_inner(prog, param_lanes, None).0 }
 /// Generate 8 parallel boundary/Zipfian/adversarial inputs per parameter inside `doms`.
 #[must_use] pub fn sample_batch_x8(doms: &[Domain], tick: usize, seed: &mut u64) -> Vec<[i64; LANES]> {
     let multi = doms.len() > 1;
-    doms.iter().enumerate().map(|(pi, &d)| {
+    doms.iter().enumerate().map(|(pi, &raw_d)| {
+        let d = raw_d.canonicalize();
         let (width, mid) = (d.width_u128(), d.lo.wrapping_add((d.width_u128() / 2) as i64));
         if tick == 0 {
             let corners = if !multi { [d.lo, d.hi, d.lo.saturating_add(1), d.hi.saturating_sub(1), 0, -1, 1, mid] }
@@ -208,13 +221,85 @@ fn coalesce_subdomains(raw: Vec<Vec<Domain>>) -> Vec<Vec<Domain>> {
 fn format_guard(safe: &[Vec<Domain>], ces: &[Counterexample], unproven_boxes: usize) -> String {
     if !safe.is_empty() { safe.iter().map(|b| fmt_box(b)).collect::<Vec<_>>().join(" || ") }
     else if !ces.is_empty() && unproven_boxes == 0 { "false".to_string() } else { "unknown".to_string() } }
+fn isqrt_i64(n: i64) -> Option<i64> {
+    if n < 0 { return None; }
+    if n < 2 { return Some(n); }
+    let (nu, mut x) = (n as u64, 1u64 << ((64 - (n as u64).leading_zeros()).div_ceil(2)));
+    loop { let nx = (x + nu / x) >> 1; if nx >= x { return Some(x as i64); } x = nx; } }
+fn push_cand(out: &mut Vec<i64>, d: Domain, raw: i64) {
+    if out.len() < 64 { let v = snap_domain(d, raw); if !out.contains(&v) { out.push(v); } } }
+fn harvest_feedback(cur: &[Domain], batch: &[[i64; LANES]], obs: &[CmpObs], cands: &mut [Vec<i64>]) {
+    for (pi, (&raw_d, out)) in cur.iter().zip(cands.iter_mut()).enumerate() {
+        let d = raw_d.canonicalize(); if d.lo == d.hi || out.len() >= 64 { continue; }
+        let mut tier2 = Vec::new();
+        for o in obs {
+            let mut active = [0usize; 2]; let mut acnt = 0usize;
+            for l in 0..LANES {
+                if !o.act[l] { continue; }
+                if acnt == 0 || (acnt == 1 && batch[pi][l] != batch[pi][active[0]]) { active[acnt] = l; acnt += 1; if acnt == 2 { break; } } }
+            for &l in &active[..acnt] {
+                let (x, a, b) = (batch[pi][l], o.lhs[l], o.rhs[l]);
+                push_cand(out, d, x ^ (a ^ b));
+                let delta = b.wrapping_sub(a);
+                push_cand(out, d, x.wrapping_add(delta)); push_cand(out, d, x.wrapping_sub(delta));
+                for tgt in [b, a] { if let Some(r) = isqrt_i64(tgt) { push_cand(out, d, r); if r > 0 { push_cand(out, d, -r); } } }
+                if x != 0 {
+                    if let Some(k) = a.checked_div(x).filter(|&k| k != 0 && k.checked_mul(x) == Some(a)) { push_cand(out, d, b.wrapping_div(k)); }
+                    if let Some(k) = b.checked_div(x).filter(|&k| k != 0 && k.checked_mul(x) == Some(b)) { push_cand(out, d, a.wrapping_div(k)); } }
+                for nb in [b, b.saturating_sub(1), b.saturating_add(1), a, a.saturating_sub(1), a.saturating_add(1)] { push_cand(&mut tier2, d, nb); } }
+            if acnt == 2 {
+                let (l1, l2) = (active[0], active[1]);
+                let (x1, d1) = (i128::from(batch[pi][l1]), i128::from(o.lhs[l1]) - i128::from(o.rhs[l1]));
+                let (x2, d2) = (i128::from(batch[pi][l2]), i128::from(o.lhs[l2]) - i128::from(o.rhs[l2]));
+                if d1 != d2 {
+                    if let Some(num) = d1.checked_mul(x2 - x1) { if let Ok(rv) = i64::try_from(x1 - num / (d2 - d1)) { push_cand(out, d, rv); } } }
+                if (d1 < 0 && d2 > 0) || (d1 > 0 && d2 < 0) { push_cand(&mut tier2, d, ((x1 + x2) / 2) as i64); } } }
+        for v in tier2 { push_cand(out, d, v); } } }
+fn shrink_better(cand: i64, best: i64) -> bool { (cand.unsigned_abs(), cand < 0) < (best.unsigned_abs(), best < 0) }
+fn shrink_counterexample(prog: &Program, cur: &[Domain], mut ce: Counterexample) -> Counterexample {
+    if ce.inputs.len() != cur.len() || ce.inputs.is_empty() { return ce; }
+    let want = ce.fault;
+    let eval_dim = |base: &[i64], dim: usize, xs: [i64; LANES]| {
+        let batch: Vec<[i64; LANES]> = base.iter().enumerate().map(|(i, &v)| if i == dim { xs } else { [v; LANES] }).collect();
+        eval_lanes_x8_inner(prog, &batch, None) };
+    for _pass in 0..2 {
+        let mut improved = false;
+        for (dim, &raw_d) in cur.iter().enumerate() {
+            let d = raw_d.canonicalize(); if d.lo == d.hi { continue; }
+            let (z, mut best) = (snap_domain(d, 0), ce.inputs[dim]);
+            let anchors = [0, 1, -1, 2, -2, best.saturating_neg(), best / 2, z].map(|v| snap_domain(d, v));
+            let (res, fnodes) = eval_dim(&ce.inputs, dim, anchors);
+            for l in 0..LANES { if (res.faults[l] & want) != 0 && shrink_better(anchors[l], best) { best = anchors[l]; ce.inputs[dim] = best; ce.node = fnodes[l]; ce.fault = res.faults[l]; improved = true; } }
+            if best != z {
+                let (mut lo, mut hi) = (z, best);
+                for _ in 0..64 {
+                    let mid = snap_domain(d, (i128::from(lo) + (i128::from(hi) - i128::from(lo)) / 2) as i64);
+                    if mid == lo || mid == hi { break; }
+                    let (r, fn2) = eval_dim(&ce.inputs, dim, [mid; LANES]);
+                    if (r.faults[0] & want) != 0 && shrink_better(mid, best) { best = mid; hi = mid; ce.inputs[dim] = best; ce.node = fn2[0]; ce.fault = r.faults[0]; improved = true; } else { lo = mid; } } }
+            if best != z {
+                let step = if best > z { -d.modulus.max(1) } else { d.modulus.max(1) };
+                let near = std::array::from_fn(|l| snap_domain(d, best.saturating_add(step.saturating_mul((l + 1) as i64))));
+                let (r, fn3) = eval_dim(&ce.inputs, dim, near);
+                for l in 0..LANES { if (r.faults[l] & want) != 0 && shrink_better(near[l], best) { best = near[l]; ce.inputs[dim] = best; ce.node = fn3[l]; ce.fault = r.faults[l]; improved = true; } } } }
+        if !improved { break; } }
+    ce }
 fn probe_box(prog: &Program, cur: &[Domain], rounds: usize, seed: &mut u64, ticks: &mut usize, evals: &mut usize, ces: &mut Vec<Counterexample>) -> bool {
+    let (mut obs, mut cands, mut cpos) = (Vec::new(), vec![Vec::new(); cur.len()], vec![0usize; cur.len()]);
     for t in 0..rounds {
-        let batch = sample_batch_x8(cur, t, seed); let res = eval_lanes_x8(prog, &batch); *ticks += 1; *evals += LANES;
+        let mut batch = sample_batch_x8(cur, t, seed);
+        if t > 0 {
+            let cap = if cur.len() == 1 { 6 } else { 4 };
+            for (pi, lanes) in batch.iter_mut().enumerate() {
+                let mut used = 0usize;
+                while used < cap && cpos[pi] < cands[pi].len() { lanes[used] = cands[pi][cpos[pi]]; cpos[pi] += 1; used += 1; } } }
+        obs.clear(); let (res, fnodes) = eval_lanes_x8_inner(prog, &batch, Some(&mut obs)); *ticks += 1; *evals += LANES;
         if let Some(lane) = res.faults.iter().position(|&f| f != FAULT_NONE) {
-            let ce = Counterexample { inputs: batch.iter().map(|lanes| lanes[lane]).collect(), node: usize::from(res.fault_nodes[lane]), fault: res.faults[lane] };
+            let raw_ce = Counterexample { inputs: batch.iter().map(|lanes| lanes[lane]).collect(), node: fnodes[lane], fault: res.faults[lane] };
+            let ce = shrink_counterexample(prog, cur, raw_ce);
             if !ces.contains(&ce) { ces.push(ce); }
-            return true; } }
+            return true; }
+        if t + 1 < rounds && !obs.is_empty() { harvest_feedback(cur, &batch, &obs, &mut cands); } }
     false }
 /// Autodidactic/Kani-class exhaustive branch-and-bound symbolic prover + 8-lane SIMD counterexample refiner.
 #[must_use] pub fn refine_and_fuzz(prog: &Program, cfg: RefineConfig) -> RefineReport {

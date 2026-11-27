@@ -56,13 +56,15 @@ impl Domain {
         if lo > hi { return Self::top(); } else if lo == hi { return Self::exact(lo); }
         let m = if modulus > 1 { modulus } else { 1 };
         let d = Self { lo, hi, modulus: m, rem: rem.rem_euclid(m) }; d.tighten().unwrap_or(d) }
+    #[must_use] pub fn canonicalize(self) -> Self { self.tighten().unwrap_or_else(Self::top) }
     #[must_use] pub const fn is_const(self) -> Option<i64> {
         if self.lo != self.hi || self.modulus < 1 || self.rem < 0 || self.rem >= self.modulus { return None; }
         if self.modulus == 1 { return Some(self.lo); }
         let r = self.lo % self.modulus; if (if r < 0 { r + self.modulus } else { r }) == self.rem { Some(self.lo) } else { None } }
-    #[must_use] pub const fn is_nonneg(self) -> bool { self.lo >= 0 }
-    #[must_use] pub fn contains(self, v: i64) -> bool { v >= self.lo && v <= self.hi && (self.modulus <= 1 || v.rem_euclid(self.modulus) == self.rem) }
-    #[must_use] pub fn width_u128(self) -> u128 { (i128::from(self.hi) - i128::from(self.lo)) as u128 }
+    #[must_use] pub const fn is_nonneg(self) -> bool { self.lo <= self.hi && self.lo >= 0 }
+    #[must_use] pub fn contains(self, v: i64) -> bool {
+        self.modulus >= 1 && self.rem >= 0 && self.rem < self.modulus && v >= self.lo && v <= self.hi && (self.modulus == 1 || v.rem_euclid(self.modulus) == self.rem) }
+    #[must_use] pub fn width_u128(self) -> u128 { if self.lo <= self.hi { (i128::from(self.hi) - i128::from(self.lo)) as u128 } else { 0 } }
     #[must_use] pub fn tighten(self) -> Option<Self> {
         if self.lo > self.hi || self.modulus < 1 || self.rem < 0 || self.rem >= self.modulus { return None; }
         if self.modulus == 1 { return Some(self); }
@@ -80,13 +82,15 @@ impl Domain {
         let m2 = d.modulus * 2;
         Some((Self { modulus: m2, rem: d.rem, ..d }.tighten()?, Self { modulus: m2, rem: d.rem + d.modulus, ..d }.tighten()?)) }
     #[must_use] pub fn rem_mod(self, d: i64) -> Option<i64> {
-        if d <= 0 { None } else if let Some(c) = self.is_const() { Some(c.rem_euclid(d)) }
+        if d <= 0 || self.lo > self.hi || self.modulus < 1 || self.rem < 0 || self.rem >= self.modulus { None }
+        else if let Some(c) = self.is_const() { Some(c.rem_euclid(d)) }
         else if self.modulus > 1 && self.modulus % d == 0 { Some(self.rem.rem_euclid(d)) } else { None } }
     #[must_use] pub fn try_meet(self, other: Self) -> Option<Self> {
-        let (lo, hi) = (self.lo.max(other.lo), self.hi.min(other.hi)); if lo > hi || self.modulus < 1 || other.modulus < 1 { return None; }
+        let (lo, hi) = (self.lo.max(other.lo), self.hi.min(other.hi));
+        if lo > hi || self.modulus < 1 || other.modulus < 1 || self.rem < 0 || self.rem >= self.modulus || other.rem < 0 || other.rem >= other.modulus { return None; }
         if self.modulus == 1 { return Self { lo, hi, modulus: other.modulus, rem: other.rem }.tighten(); }
         if other.modulus == 1 { return Self { lo, hi, modulus: self.modulus, rem: self.rem }.tighten(); }
-        let (m1, r1, m2, r2) = (i128::from(self.modulus), i128::from(self.rem), i128::from(other.modulus), i128::from(other.rem)); if r1 < 0 || r1 >= m1 || r2 < 0 || r2 >= m2 { return None; }
+        let (m1, r1, m2, r2) = (i128::from(self.modulus), i128::from(self.rem), i128::from(other.modulus), i128::from(other.rem));
         let (g, s, _) = ext_gcd_i128(m1, m2); let diff = r2 - r1; if diff % g != 0 { return None; }
         let (m1_g, m2_g) = (m1 / g, m2 / g); let lcm = m1_g.checked_mul(m2)?; let k = ((diff / g).rem_euclid(m2_g) * s.rem_euclid(m2_g)).rem_euclid(m2_g); let r = (r1 + m1 * k).rem_euclid(lcm);
         let (lo128, hi128) = (i128::from(lo), i128::from(hi)); let (nlo, nhi) = (lo128 + (r - lo128.rem_euclid(lcm)).rem_euclid(lcm), hi128 - (hi128.rem_euclid(lcm) - r).rem_euclid(lcm));
@@ -96,81 +100,87 @@ impl Domain {
         else {
             let (modulus, rem) = if other.modulus > self.modulus { (other.modulus, other.rem) } else { (self.modulus, self.rem) };
             Self { lo: nlo as i64, hi: nhi as i64, modulus, rem }.tighten() } }
-    #[must_use] pub fn meet(self, other: Self) -> Self { self.try_meet(other).unwrap_or(self) }
+    #[must_use] pub fn meet(self, other: Self) -> Self { self.try_meet(other).unwrap_or_else(|| self.canonicalize()) }
     #[must_use] pub fn join(self, other: Self) -> Self {
-        if self == other { return self; }
-        let (lo, hi) = (self.lo.min(other.lo), self.hi.max(other.hi)); if lo == hi { return Self::exact(lo); }
-        let (m1, r1) = self.is_const().map_or((i128::from(self.modulus), i128::from(self.rem)), |c| (0, i128::from(c)));
-        let (m2, r2) = other.is_const().map_or((i128::from(other.modulus), i128::from(other.rem)), |c| (0, i128::from(c)));
+        let (a, b) = (self.canonicalize(), other.canonicalize()); if a == b { return a; }
+        let (lo, hi) = (a.lo.min(b.lo), a.hi.max(b.hi)); if lo == hi { return Self::exact(lo); }
+        let (m1, r1) = a.is_const().map_or((i128::from(a.modulus), i128::from(a.rem)), |c| (0, i128::from(c)));
+        let (m2, r2) = b.is_const().map_or((i128::from(b.modulus), i128::from(b.rem)), |c| (0, i128::from(c)));
         let g1 = if m1 == 0 { m2 } else if m2 == 0 { m1 } else { gcd_i128(m1, m2) }; let diff = (r1 - r2).abs();
         let g = if g1 == 0 { diff } else if diff == 0 { g1 } else { gcd_i128(g1, diff) }; let m = if g > 1 && g <= i128::from(i64::MAX / 2) { g as i64 } else { 1 };
         Self::congruent(lo, hi, m, r1.rem_euclid(i128::from(m)) as i64) }
     fn from_i128(lo: i128, hi: i128, modulus: i64, rem: i64) -> (Self, bool) { if lo >= i128::from(i64::MIN) && hi <= i128::from(i64::MAX) && lo <= hi { (Self::congruent(lo as i64, hi as i64, modulus, rem), false) } else { (Self::top(), true) } }
     #[must_use] pub fn eval_add_sub(self, rhs: Self, is_sub: bool) -> (Self, bool) {
-        let (g, ra, rb) = match (self.is_const(), rhs.is_const()) {
-            (Some(a), Some(b)) => (1i64, i128::from(a), i128::from(b)),
-            (None, Some(b)) => (self.modulus, i128::from(self.rem), i128::from(b)),
-            (Some(a), None) => (rhs.modulus, i128::from(a), i128::from(rhs.rem)),
-            (None, None) => (gcd_i64(self.modulus, rhs.modulus), i128::from(self.rem), i128::from(rhs.rem)),
-        }; let (g128, (a0, a1, b0, b1)) = (i128::from(g), (i128::from(self.lo), i128::from(self.hi), i128::from(rhs.lo), i128::from(rhs.hi)));
+        let (a, b) = (self.canonicalize(), rhs.canonicalize());
+        let (g, ra, rb) = match (a.is_const(), b.is_const()) {
+            (Some(x), Some(y)) => (1i64, i128::from(x), i128::from(y)),
+            (None, Some(y)) => (a.modulus, i128::from(a.rem), i128::from(y)),
+            (Some(x), None) => (b.modulus, i128::from(x), i128::from(b.rem)),
+            (None, None) => (gcd_i64(a.modulus, b.modulus), i128::from(a.rem), i128::from(b.rem)),
+        }; let (g128, (a0, a1, b0, b1)) = (i128::from(g), (i128::from(a.lo), i128::from(a.hi), i128::from(b.lo), i128::from(b.hi)));
         if is_sub { Self::from_i128(a0 - b1, a1 - b0, g, (ra - rb).rem_euclid(g128) as i64) }
         else { Self::from_i128(a0 + b0, a1 + b1, g, (ra + rb).rem_euclid(g128) as i64) } }
     #[must_use] pub fn eval_square(self) -> (Self, bool) {
-        let (a0, a1) = (i128::from(self.lo), i128::from(self.hi)); let (p0, p1) = (a0 * a0, a1 * a1);
-        let lo = if self.lo <= 0 && self.hi >= 0 {
-            if self.contains(0) { 0 } else { let pos = i128::from(self.rem); let neg = pos - i128::from(self.modulus); (pos * pos).min(neg * neg) }
+        let a = self.canonicalize(); let (a0, a1) = (i128::from(a.lo), i128::from(a.hi)); let (p0, p1) = (a0 * a0, a1 * a1);
+        let lo = if a.lo <= 0 && a.hi >= 0 {
+            if a.contains(0) { 0 } else { let pos = i128::from(a.rem); let neg = pos - i128::from(a.modulus); (pos * pos).min(neg * neg) }
         } else { p0.min(p1) };
-        let (m, r) = if self.modulus > 1 {
-            let (m128, r128) = (i128::from(self.modulus), i128::from(self.rem)); let lifted = m128.saturating_mul(gcd_i128(m128 + 2 * r128, 2 * m128));
+        let (m, r) = if a.modulus > 1 {
+            let (m128, r128) = (i128::from(a.modulus), i128::from(a.rem)); let lifted = m128.saturating_mul(gcd_i128(m128 + 2 * r128, 2 * m128));
             let mm = if lifted <= i128::from(i64::MAX / 2) { lifted } else { m128 };
             (mm as i64, (r128 * r128).rem_euclid(mm) as i64)
         } else { (1, 0) };
         Self::from_i128(lo, p0.max(p1), m, r) }
     #[must_use] pub fn eval_mul(self, rhs: Self) -> (Self, bool) {
-        if self.is_const() == Some(0) || rhs.is_const() == Some(0) { return (Self::exact(0), false); }
-        let (a0, a1, b0, b1) = (i128::from(self.lo), i128::from(self.hi), i128::from(rhs.lo), i128::from(rhs.hi)); let p = [a0 * b0, a0 * b1, a1 * b0, a1 * b1];
+        let (a, b) = (self.canonicalize(), rhs.canonicalize());
+        if a.is_const() == Some(0) || b.is_const() == Some(0) { return (Self::exact(0), false); }
+        let (a0, a1, b0, b1) = (i128::from(a.lo), i128::from(a.hi), i128::from(b.lo), i128::from(b.hi)); let p = [a0 * b0, a0 * b1, a1 * b0, a1 * b1];
         let (lo, hi, cap) = (p.into_iter().min().unwrap_or(i128::from(i64::MIN)), p.into_iter().max().unwrap_or(i128::from(i64::MAX)), i128::from(i64::MAX / 2));
         let scale = |dm: i64, dr: i64, c: i64| {
             let mm = i128::from(dm).saturating_mul(i128::from(c).abs()); if mm > 1 && mm <= cap { (mm as i64, (i128::from(dr) * i128::from(c)).rem_euclid(mm) as i64) } else { (1, 0) }
-        }; let (m, rem) = if let Some(c) = rhs.is_const() { scale(self.modulus, self.rem, c) }
-        else if let Some(c) = self.is_const() { scale(rhs.modulus, rhs.rem, c) }
+        }; let (m, rem) = if let Some(c) = b.is_const() { scale(a.modulus, a.rem, c) }
+        else if let Some(c) = a.is_const() { scale(b.modulus, b.rem, c) }
         else {
-            let (ma, ra, mb, rb) = (i128::from(self.modulus), i128::from(self.rem), i128::from(rhs.modulus), i128::from(rhs.rem));
+            let (ma, ra, mb, rb) = (i128::from(a.modulus), i128::from(a.rem), i128::from(b.modulus), i128::from(b.rem));
             let mm = gcd_i128(gcd_i128(ma.saturating_mul(mb), ma.saturating_mul(rb)), mb.saturating_mul(ra));
             if mm > 1 && mm <= cap { (mm as i64, (ra * rb).rem_euclid(mm) as i64) } else { (1, 0) } };
         Self::from_i128(lo, hi, m, rem) }
     #[must_use] pub fn eval_div_rem(self, rhs_raw: Self, is_rem: bool) -> (Self, bool) {
-        let Some(rhs) = rhs_raw.tighten() else { return (Self::top(), true); }; if rhs.contains(0) || (self.lo == i64::MIN && rhs.contains(-1)) { return (Self::top(), true); }
-        if let (Some(a), Some(b)) = (self.is_const(), rhs.is_const()) { return (Self::exact(if is_rem { a % b } else { a / b }), false); }
+        let (Some(lhs), Some(rhs)) = (self.tighten(), rhs_raw.tighten()) else { return (Self::top(), true); };
+        if rhs.contains(0) || (lhs.lo == i64::MIN && rhs.contains(-1)) { return (Self::top(), true); }
+        if let (Some(a), Some(b)) = (lhs.is_const(), rhs.is_const()) { return (Self::exact(if is_rem { a % b } else { a / b }), false); }
         if !is_rem {
             let (mut lo, mut hi) = (i64::MAX, i64::MIN);
-            for d in [rhs.lo, rhs.hi, rhs.rem, rhs.rem - rhs.modulus] { if d != 0 && d >= rhs.lo && d <= rhs.hi { for a in [self.lo, self.hi] { lo = lo.min(a / d); hi = hi.max(a / d); } } }
+            for d in [rhs.lo, rhs.hi, rhs.rem, rhs.rem - rhs.modulus] { if d != 0 && d >= rhs.lo && d <= rhs.hi { for a in [lhs.lo, lhs.hi] { lo = lo.min(a / d); hi = hi.max(a / d); } } }
             return (Self::range(lo, hi), false); }
         if let Some(d) = rhs.is_const().filter(|&d| d > 0) {
-            if !self.is_nonneg() { return (Self::range(-(d - 1), d - 1), false); }
-            if self.hi < d { return (self, false); }
-            let g = gcd_i64(self.modulus, d);
-            return if g > 1 { let r0 = self.rem.rem_euclid(g); (Self::congruent(r0, r0 + ((d - 1 - r0) / g) * g, g, r0), false) } else { (Self::range(0, d - 1), false) }; }
+            if !lhs.is_nonneg() { return (Self::range(-(d - 1), d - 1), false); }
+            if lhs.hi < d { return (lhs, false); }
+            let g = gcd_i64(lhs.modulus, d);
+            return if g > 1 { let r0 = lhs.rem.rem_euclid(g); (Self::congruent(r0, r0 + ((d - 1 - r0) / g) * g, g, r0), false) } else { (Self::range(0, d - 1), false) }; }
         let lim = (i128::from(rhs.lo).abs().max(i128::from(rhs.hi).abs()) - 1).min(i128::from(i64::MAX)) as i64;
-        (Self::range(if self.is_nonneg() { 0 } else { -lim }, lim), false) }
+        (Self::range(if lhs.is_nonneg() { 0 } else { -lim }, lim), false) }
     #[must_use] pub fn eval_shl(self, s: u8) -> (Self, bool) {
+        let a = self.canonicalize();
         if s >= 64 { (Self::top(), true) } else if s == 63 { (Self::top(), false) }
-        else { (Self::from_i128(i128::from(self.lo) << s, i128::from(self.hi) << s, if s > 0 && s < 62 { 1i64 << s } else { 1 }, 0).0, false) } }
-    #[must_use] pub fn eval_shr(self, s: u8) -> (Self, bool) { if s >= 64 { (Self::top(), true) } else { (Self::range(self.lo >> s, self.hi >> s), false) } }
+        else { (Self::from_i128(i128::from(a.lo) << s, i128::from(a.hi) << s, if s > 0 && s < 62 { 1i64 << s } else { 1 }, 0).0, false) } }
+    #[must_use] pub fn eval_shr(self, s: u8) -> (Self, bool) { let a = self.canonicalize(); if s >= 64 { (Self::top(), true) } else { (Self::range(a.lo >> s, a.hi >> s), false) } }
     #[must_use] pub fn eval_bit(self, rhs: Self, kind: u8) -> Self {
-        if let (Some(a), Some(b)) = (self.is_const(), rhs.is_const()) { return Self::exact(match kind { 0 => a & b, 1 => a | b, _ => a ^ b }); }
-        if kind == 0 { return match (self.is_nonneg(), rhs.is_nonneg()) { (true, true) => Self::range(0, self.hi.min(rhs.hi)), (false, true) => Self::range(0, rhs.hi), (true, false) => Self::range(0, self.hi), _ => Self::top() }; }
-        if self.is_nonneg() && rhs.is_nonneg() { let mv = self.hi.max(rhs.hi) as u64; return Self::range(0, if mv == 0 { 0 } else { ((1u64 << (64 - mv.leading_zeros()).min(63)) - 1) as i64 }); }
+        let (a, b) = (self.canonicalize(), rhs.canonicalize());
+        if let (Some(x), Some(y)) = (a.is_const(), b.is_const()) { return Self::exact(match kind { 0 => x & y, 1 => x | y, _ => x ^ y }); }
+        if kind == 0 { return match (a.is_nonneg(), b.is_nonneg()) { (true, true) => Self::range(0, a.hi.min(b.hi)), (false, true) => Self::range(0, b.hi), (true, false) => Self::range(0, a.hi), _ => Self::top() }; }
+        if a.is_nonneg() && b.is_nonneg() { let mv = a.hi.max(b.hi) as u64; return Self::range(0, if mv == 0 { 0 } else { ((1u64 << (64 - mv.leading_zeros()).min(63)) - 1) as i64 }); }
         Self::top() }
     #[must_use] pub fn eval_cmp(self, kind: CmpKind, rhs: Self) -> Self {
-        if let (Some(a), Some(b)) = (self.is_const(), rhs.is_const()) { return Self::exact(i64::from(kind.eval(a, b))); }
+        let (a, b) = (self.canonicalize(), rhs.canonicalize());
+        if let (Some(x), Some(y)) = (a.is_const(), b.is_const()) { return Self::exact(i64::from(kind.eval(x, y))); }
         match kind {
-            CmpKind::Eq => self.try_meet(rhs).is_none().then_some(0),
-            CmpKind::Ne => self.try_meet(rhs).is_none().then_some(1),
-            CmpKind::Lt => if self.hi < rhs.lo { Some(1) } else if self.lo >= rhs.hi { Some(0) } else { None },
-            CmpKind::Le => if self.hi <= rhs.lo { Some(1) } else if self.lo > rhs.hi { Some(0) } else { None },
-            CmpKind::Gt => if self.lo > rhs.hi { Some(1) } else if self.hi <= rhs.lo { Some(0) } else { None },
-            CmpKind::Ge => if self.lo >= rhs.hi { Some(1) } else if self.hi < rhs.lo { Some(0) } else { None },
+            CmpKind::Eq => a.try_meet(b).is_none().then_some(0),
+            CmpKind::Ne => a.try_meet(b).is_none().then_some(1),
+            CmpKind::Lt => if a.hi < b.lo { Some(1) } else if a.lo >= b.hi { Some(0) } else { None },
+            CmpKind::Le => if a.hi <= b.lo { Some(1) } else if a.lo > b.hi { Some(0) } else { None },
+            CmpKind::Gt => if a.lo > b.hi { Some(1) } else if a.hi <= b.lo { Some(0) } else { None },
+            CmpKind::Ge => if a.lo >= b.hi { Some(1) } else if a.hi < b.lo { Some(0) } else { None },
         }.map_or(Self::range(0, 1), Self::exact) } }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BufSpec {
@@ -192,7 +202,7 @@ impl<Id: Copy> Op<Id> {
             Self::Alloc { .. } => Domain::range(1, i64::MAX), Self::Free(_) => Domain::exact(0),
             Self::CheckGen { expected, .. } => dom(expected), Self::Load { buf, .. } => bdom(buf), Self::Store { val, .. } => dom(val),
             Self::BoundsCheck { idx, limit } => if limit > 0 { dom(idx).meet(Domain::range(0, i64::try_from(limit - 1).unwrap_or(i64::MAX))) } else { Domain::top() },
-            Self::DynBoundsCheck(idx, len) => { let dl = dom(len); if dl.hi > 0 { dom(idx).meet(Domain::range(0, dl.hi - 1)) } else { Domain::top() } }
+            Self::DynBoundsCheck(idx, len) => { let dl = dom(len).canonicalize(); if dl.hi > 0 { dom(idx).meet(Domain::range(0, dl.hi - 1)) } else { Domain::top() } }
             Self::PanicIfZero(cond, _) => dom(cond),
             Self::Add(a, b) | Self::WrapAdd(a, b) => dom(a).eval_add_sub(dom(b), false).0,
             Self::Sub(a, b) | Self::WrapSub(a, b) => dom(a).eval_add_sub(dom(b), true).0,
@@ -200,10 +210,10 @@ impl<Id: Copy> Op<Id> {
             Self::Div(a, b) => dom(a).eval_div_rem(dom(b), false).0, Self::Rem(a, b) => dom(a).eval_div_rem(dom(b), true).0,
             Self::Shl(a, s) => dom(a).eval_shl(s).0, Self::Shr(a, s) => dom(a).eval_shr(s).0,
             Self::ShlVar(a, b) => dom(b).is_const().filter(|&s| (0..64).contains(&s)).map_or(Domain::top(), |s| dom(a).eval_shl(s as u8).0),
-            Self::ShrVar(a, b) => { let (da, db) = (dom(a), dom(b)); if db.lo >= 0 && db.hi < 64 { if da.is_nonneg() { Domain::range(da.lo >> db.hi, da.hi >> db.lo) } else { Domain::range(da.lo >> db.lo, da.hi >> db.lo) } } else { Domain::top() } }
+            Self::ShrVar(a, b) => { let (da, db) = (dom(a).canonicalize(), dom(b).canonicalize()); if db.lo >= 0 && db.hi < 64 { if da.is_nonneg() { Domain::range(da.lo >> db.hi, da.hi >> db.lo) } else { Domain::range(da.lo >> db.lo, da.hi >> db.lo) } } else { Domain::top() } }
             Self::BitAnd(a, b) => dom(a).eval_bit(dom(b), 0), Self::BitOr(a, b) => dom(a).eval_bit(dom(b), 1), Self::BitXor(a, b) => dom(a).eval_bit(dom(b), 2),
             Self::Cmp(k, a, b) => dom(a).eval_cmp(k, dom(b)),
-            Self::Select { cond, t_val, f_val } => { let cd = dom(cond); if cd.is_const() == Some(0) { dom(f_val) } else if !cd.contains(0) { dom(t_val) } else { dom(t_val).join(dom(f_val)) } }
+            Self::Select { cond, t_val, f_val } => { let cd = dom(cond).canonicalize(); if cd.is_const() == Some(0) { dom(f_val) } else if !cd.contains(0) { dom(t_val) } else { dom(t_val).join(dom(f_val)) } }
         } } }
 #[derive(Clone, Debug)]
 pub struct Program {
@@ -426,9 +436,9 @@ impl CheckAcc {
         let in_b = d.lo >= 0 && i128::from(d.hi) < lim;
         if all_init && in_b { self.proven += 1; } else if !any_init && !bs.may_init.is_some_and(|m| m.lo <= d.hi && d.lo <= m.hi) && in_b { return Err(err()); } else { self.mark(err()); }
         Ok(()) } }
-struct BufInitState { st: AllocState, may_dead: bool, written_ec: BTreeSet<usize>, hi_init: BTreeSet<usize>, may_init: Option<Domain> }
+struct BufInitState { st: AllocState, may_dead: bool, may_realloc: bool, written_ec: BTreeSet<usize>, hi_init: BTreeSet<usize>, may_init: Option<Domain> }
 impl BufInitState {
-    fn from_buf(buf: &BufSpec) -> Self { Self { st: AllocState::from_buf(buf), may_dead: false, written_ec: BTreeSet::new(), hi_init: BTreeSet::new(), may_init: None } }
+    fn from_buf(buf: &BufSpec) -> Self { Self { st: AllocState::from_buf(buf), may_dead: false, may_realloc: false, written_ec: BTreeSet::new(), hi_init: BTreeSet::new(), may_init: None } }
     fn reset_init(&mut self) { self.written_ec.clear(); self.hi_init.clear(); self.may_init = None; }
     fn is_init(&self, s: usize) -> bool { self.st.is_slot_init(s) || self.hi_init.contains(&s) } }
 fn calc_su(uniq: &[usize], su: &[usize]) -> usize {
@@ -453,14 +463,21 @@ fn apply_egraph_rules(nodes: &[IrOp], uf: &mut [usize], doms: &mut [Domain], id:
 struct MemDomState { gens: Vec<(u32, bool)>, bg: Vec<Option<Domain>>, exact: Vec<BTreeMap<i64, Domain>> }
 impl MemDomState {
     fn new(bufs: &[BufSpec]) -> Self { Self { gens: vec![(1, true); bufs.len()], bg: bufs.iter().map(|b| b.pre_init.then_some(b.elem_domain)).collect(), exact: vec![BTreeMap::new(); bufs.len()] } }
+    fn havoc_buf(&mut self, bi: usize, elem_dom: Domain) {
+        let mut acc = self.bg[bi].map_or(elem_dom, |cur| cur.join(elem_dom));
+        for &sd in self.exact[bi].values() { acc = acc.join(sd); }
+        self.exact[bi].clear(); self.bg[bi] = Some(acc); }
     fn eval(&mut self, bufs: &[BufSpec], op: IrOp, certain: bool, d_at: impl Fn(NodeId) -> Domain, pdoms: &[Domain]) -> Domain {
         match op {
             Op::Alloc { buf, .. } => {
-                if !certain { return Domain::range(1, i64::MAX); }
-                let bi = usize::from(buf); let (g, alive) = &mut self.gens[bi];
+                let bi = usize::from(buf);
+                if !certain { self.havoc_buf(bi, bufs[bi].elem_domain); return Domain::range(1, i64::MAX); }
+                let (g, alive) = &mut self.gens[bi];
                 *g = g.wrapping_add(1); *alive = true; self.bg[bi] = None; self.exact[bi].clear(); Domain::exact(i64::from(*g)) }
             Op::Free(buf) => {
-                if certain { let bi = usize::from(buf); let (g, alive) = &mut self.gens[bi]; if *alive { *g = g.wrapping_add(1); *alive = false; } self.bg[bi] = None; self.exact[bi].clear(); }
+                let bi = usize::from(buf);
+                if certain { let (g, alive) = &mut self.gens[bi]; if *alive { *g = g.wrapping_add(1); *alive = false; } self.bg[bi] = None; self.exact[bi].clear(); }
+                else { self.havoc_buf(bi, bufs[bi].elem_domain); }
                 Domain::exact(0) }
             Op::Store { buf, idx, val } => {
                 let (bi, idom, vd) = (usize::from(buf), d_at(idx), d_at(val));
@@ -481,15 +498,24 @@ impl MemDomState {
     } }
 fn check_mem_op(id: NodeId, op: IrOp, certain: bool, d_at: &impl Fn(NodeId) -> Domain, uf: &[usize], bstates: &mut [BufInitState], acc: &mut CheckAcc) -> Result<(), VerifyError> {
     match op {
-        Op::Alloc { buf, len } => { let bs = &mut bstates[usize::from(buf)]; if certain { bs.st.alloc(len); bs.may_dead = false; bs.reset_init(); acc.proven += 1; } else { bs.st.len = bs.st.len.min(len); } }
+        Op::Alloc { buf, len } => {
+            let bs = &mut bstates[usize::from(buf)];
+            if certain { bs.st.alloc(len); bs.may_dead = false; bs.may_realloc = false; bs.reset_init(); acc.proven += 1; }
+            else {
+                if !bs.st.alive { bs.st.alive = true; bs.may_dead = true; }
+                if (bs.st.all_init || bs.st.init_mask != 0 || !bs.hi_init.is_empty() || !bs.written_ec.is_empty()) && bs.st.len > 0 {
+                    let span = Domain::range(0, i64::try_from(bs.st.len - 1).unwrap_or(i64::MAX));
+                    bs.may_init = Some(bs.may_init.map_or(span, |cur| cur.join(span))); }
+                bs.st.all_init = false; bs.st.init_mask = 0; bs.written_ec.clear(); bs.hi_init.clear();
+                bs.st.len = bs.st.len.min(len); bs.may_realloc = true; } }
         Op::Free(buf) => {
             let bs = &mut bstates[usize::from(buf)]; if !bs.st.alive { return Err(VerifyError::DoubleFree { node: id, buf, generation: bs.st.generation }); }
             if bs.may_dead { acc.mark(VerifyError::DoubleFree { node: id, buf, generation: bs.st.generation }); }
-            if certain { let _ = bs.st.free(); bs.may_dead = false; bs.reset_init(); acc.proven += 1; } else { bs.may_dead = true; } }
+            if certain { let _ = bs.st.free(); bs.may_dead = false; bs.may_realloc = false; bs.reset_init(); acc.proven += 1; } else { bs.may_dead = true; } }
         Op::CheckGen { buf, expected } => {
             let (bs, de) = (&bstates[usize::from(buf)], d_at(expected));
-            if !bs.st.alive || !de.contains(i64::from(bs.st.generation)) { return Err(VerifyError::UseAfterFree { node: id, buf, generation: bs.st.generation }); }
-            if !bs.may_dead && de.is_const() == Some(i64::from(bs.st.generation)) { acc.proven += 1; } else { acc.mark(VerifyError::UseAfterFree { node: id, buf, generation: bs.st.generation }); } }
+            if !bs.st.alive || (!bs.may_realloc && !de.contains(i64::from(bs.st.generation))) { return Err(VerifyError::UseAfterFree { node: id, buf, generation: bs.st.generation }); }
+            if !bs.may_dead && !bs.may_realloc && de.is_const() == Some(i64::from(bs.st.generation)) { acc.proven += 1; } else { acc.mark(VerifyError::UseAfterFree { node: id, buf, generation: bs.st.generation }); } }
         Op::Load { buf, idx } => {
             let (bs, di) = (&bstates[usize::from(buf)], d_at(idx)); if !bs.st.alive { return Err(VerifyError::UseAfterFree { node: id, buf, generation: bs.st.generation }); }
             if bs.may_dead { acc.mark(VerifyError::UseAfterFree { node: id, buf, generation: bs.st.generation }); }
@@ -533,22 +559,26 @@ fn check_arith_op(id: NodeId, op: IrOp, d_at: &impl Fn(NodeId) -> Domain, gctx: 
 impl Program {
     #[must_use] pub fn new(name: impl Into<String>) -> Self {
         Self { name: name.into(), bufs: Vec::new(), param_domains: Vec::new(), param_names: Vec::new(), nodes: Vec::new(), node_guards: Vec::new(), outputs: Vec::new(), simd_lanes: 8, check_reg_budget: true } }
+    fn push_buf_spec(&mut self, mut spec: BufSpec) -> u8 {
+        let id = u8::try_from(self.bufs.len()).unwrap_or(u8::MAX); spec.id = id; self.bufs.push(spec); id }
     pub fn add_buf(&mut self, name: impl Into<String>, len: usize, mutable: bool, region: u16, offset: usize, elem_domain: Domain) -> u8 {
-        let id = self.bufs.len() as u8;
-        self.bufs.push(BufSpec { id, name: name.into(), len, mutable, region, offset, elem_domain, pre_init: true }); id }
+        self.push_buf_spec(BufSpec { id: 0, name: name.into(), len, mutable, region, offset, elem_domain, pre_init: true }) }
     pub fn add_uninit_buf(&mut self, name: impl Into<String>, len: usize, mutable: bool, region: u16, offset: usize, elem_domain: Domain) -> u8 {
-        let id = self.add_buf(name, len, mutable, region, offset, elem_domain); self.bufs[usize::from(id)].pre_init = false; id }
+        self.push_buf_spec(BufSpec { id: 0, name: name.into(), len, mutable, region, offset, elem_domain, pre_init: false }) }
     pub fn add_param(&mut self, domain: Domain) -> NodeId { let pid = self.param_domains.len(); self.add_named_param(format!("p{pid}"), domain) }
     pub fn add_named_param(&mut self, name: impl Into<String>, domain: Domain) -> NodeId {
-        let pid = self.param_domains.len() as u8; self.param_domains.push(domain); self.param_names.push(name.into());
+        let pid = u8::try_from(self.param_domains.len()).unwrap_or(u8::MAX); self.param_domains.push(domain); self.param_names.push(name.into());
         self.push(Op::Param(pid)) }
     pub fn push(&mut self, op: IrOp) -> NodeId { self.push_guarded(op, None) }
     pub fn push_guarded(&mut self, op: IrOp, guard: Option<(NodeId, bool)>) -> NodeId { let id = self.nodes.len(); self.nodes.push(op); self.node_guards.push(guard); id }
     #[must_use] pub fn guard_of(&self, id: NodeId) -> Option<(NodeId, bool)> { self.node_guards.get(id).copied().flatten() }
     pub fn add_output(&mut self, id: NodeId) { self.outputs.push(id); }
     pub fn validate(&self) -> Result<(), VerifyError> {
+        if self.param_domains.len() > 256 { return Err(VerifyError::InvalidParam(u8::MAX)); }
+        if self.bufs.len() > 256 { return Err(VerifyError::InvalidBuffer(u8::MAX)); }
+        if self.node_guards.len() != self.nodes.len() { return Err(VerifyError::InvalidNode(self.nodes.len())); }
         for (pid, &d) in self.param_domains.iter().enumerate() { if d.tighten().is_none() { return Err(VerifyError::InvalidParam(pid as u8)); } }
-        for b in &self.bufs { if b.elem_domain.tighten().is_none() { return Err(VerifyError::InvalidBuffer(b.id)); } }
+        for (bi, b) in self.bufs.iter().enumerate() { if usize::from(b.id) != bi || b.elem_domain.tighten().is_none() { return Err(VerifyError::InvalidBuffer(b.id)); } }
         self.check_noalias()?;
         for (id, &op) in self.nodes.iter().enumerate() {
             let (kids, cnt) = op.children(); for &k in &kids[..cnt] { if k >= id { return Err(VerifyError::InvalidNode(k)); } }
@@ -597,9 +627,18 @@ impl Program {
                     if let Some(c) = doms[uf_find(&uf, id)].is_const() { let prev = *memo.entry((None, Op::Const(c))).or_insert(id); if prev != id { uf_union(&mut uf, &mut doms, prev, id); } } }
             } else if canon.is_pure() && !matches!(canon, Op::BoundsCheck { .. } | Op::DynBoundsCheck(_, _) | Op::PanicIfZero(_, _)) { if let Some(&prev) = memo.get(&(None, canon)) { uf[id] = uf_find(&uf, prev); } } }
         ((0..n).map(|i| doms[uf_find(&uf, i)]).collect(), uf) }
-    #[must_use] pub fn infer_domains(&self, pdoms: &[Domain]) -> Vec<Domain> { self.infer_domains_with_uf(pdoms).0 }
+    #[must_use] pub fn infer_domains(&self, pdoms: &[Domain]) -> Vec<Domain> {
+        if self.validate().is_err() || pdoms.len() < self.param_domains.len() { return Vec::new(); }
+        let canon: Vec<Domain> = pdoms.iter().map(|&d| d.canonicalize()).collect();
+        self.infer_domains_with_uf(&canon).0 }
     #[must_use] pub fn check_obligations(&self, pdoms: &[Domain]) -> (Vec<Domain>, ProofStatus, usize) {
-        let (doms, uf) = self.infer_domains_with_uf(pdoms);
+        if let Err(e) = self.validate() { return (Vec::new(), ProofStatus::Uncertain(e), 0); }
+        if pdoms.len() < self.param_domains.len() { return (Vec::new(), ProofStatus::Uncertain(VerifyError::InvalidParam(u8::try_from(pdoms.len()).unwrap_or(u8::MAX))), 0); }
+        let mut canon = Vec::with_capacity(self.param_domains.len());
+        for (pid, &d) in pdoms.iter().take(self.param_domains.len()).enumerate() {
+            let Some(td) = d.tighten() else { return (Vec::new(), ProofStatus::Uncertain(VerifyError::InvalidParam(pid as u8)), 0); };
+            canon.push(td); }
+        let (doms, uf) = self.infer_domains_with_uf(&canon);
         let (mut bstates, mut acc): (Vec<BufInitState>, CheckAcc) = (self.bufs.iter().map(BufInitState::from_buf).collect(), CheckAcc::default());
         let (gctx, empty_ov) = (GuardCtx { prog: self, base: &doms, uf: &uf }, RelOverlay::default());
         for (id, &op) in self.nodes.iter().enumerate() {

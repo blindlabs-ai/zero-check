@@ -212,11 +212,13 @@ struct EnumDef { variants: BTreeMap<String, i64>, max_disc: i64 }
 pub(crate) struct FileIndex {
     pub(crate) fns: Vec<FnItem>, consts: BTreeMap<String, (i64, Option<ScalarTy>)>, str_consts: BTreeMap<String, (usize, bool)>,
     structs: BTreeMap<String, StructDef>, enums: BTreeMap<String, EnumDef>, type_aliases: BTreeMap<String, ScalarTy>, }
+pub(crate) const MAX_AST_DEPTH: u16 = 64;
 impl FileIndex {
     fn resolve_scalar(&self, name: &str) -> Option<ScalarTy> { ScalarTy::from_name(name).or_else(|| self.type_aliases.get(name).copied()) }
-    fn eval_const_atom(&self, c: &mut Cursor<'_>, self_ty: Option<&str>) -> Option<(i64, Option<ScalarTy>)> {
-        if c.eat_sym("-") { let (v, ty) = self.eval_const_atom(c, self_ty)?; return Some((v.checked_neg()?, ty)); }
-        if c.eat_sym("(") { let r = self.eval_const_expr(c, self_ty)?; return c.eat_sym(")").then_some(r); }
+    fn eval_const_atom(&self, c: &mut Cursor<'_>, self_ty: Option<&str>, depth: u16) -> Option<(i64, Option<ScalarTy>)> {
+        if depth >= MAX_AST_DEPTH { return None; }
+        if c.eat_sym("-") { let (v, ty) = self.eval_const_atom(c, self_ty, depth + 1)?; return Some((v.checked_neg()?, ty)); }
+        if c.eat_sym("(") { let r = self.eval_const_expr_d(c, self_ty, depth + 1)?; return c.eat_sym(")").then_some(r); }
         match c.peek()? {
             &Tok::Int(v, ty) => { c.pos += 1; Some((v, ty)) }
             Tok::Ident(nm) => {
@@ -228,17 +230,19 @@ impl FileIndex {
                     return self.consts.get(&format!("{base}::{sub}")).copied(); }
                 self.consts.get(&nm).copied() }
             _ => None, } }
-    fn eval_const_expr(&self, c: &mut Cursor<'_>, self_ty: Option<&str>) -> Option<(i64, Option<ScalarTy>)> {
-        let (mut v, mut ty) = self.eval_const_atom(c, self_ty)?;
+    fn eval_const_expr_d(&self, c: &mut Cursor<'_>, self_ty: Option<&str>, depth: u16) -> Option<(i64, Option<ScalarTy>)> {
+        if depth >= MAX_AST_DEPTH { return None; }
+        let (mut v, mut ty) = self.eval_const_atom(c, self_ty, depth + 1)?;
         while let Some(&Tok::Sym(op)) = c.peek() {
             if !matches!(op, "+" | "-" | "*" | "/" | "%" | "<<" | ">>" | "|" | "&" | "^") { break; }
-            c.pos += 1; let (r, rty) = self.eval_const_atom(c, self_ty)?; ty = ty.or(rty);
+            c.pos += 1; let (r, rty) = self.eval_const_atom(c, self_ty, depth + 1)?; ty = ty.or(rty);
             v = match op {
                 "+" => v.checked_add(r)?, "-" => v.checked_sub(r)?, "*" => v.checked_mul(r)?, "/" => v.checked_div(r)?, "%" => v.checked_rem(r)?, "|" => v | r, "&" => v & r, "^" => v ^ r,
                 "<<" if (0..64).contains(&r) => v.checked_shl(r as u32)?, ">>" if (0..64).contains(&r) => v.checked_shr(r as u32)?, _ => return None,
             }; }
         if c.eat_ident("as") { let dt = self.resolve_scalar(&c.expect_ident()?)?; let (lo, hi) = dt.bounds(); if v < lo || v > hi { return None; } ty = Some(dt); }
-        Some((v, ty)) } }
+        Some((v, ty)) }
+    fn eval_const_expr(&self, c: &mut Cursor<'_>, self_ty: Option<&str>) -> Option<(i64, Option<ScalarTy>)> { self.eval_const_expr_d(c, self_ty, 0) } }
 fn scan_const_item(c: &mut Cursor<'_>, idx: &mut FileIndex, prefix: Option<&str>) {
     let Some(name) = c.expect_ident() else { return; };
     if c.eat_sym(":") {
@@ -292,7 +296,8 @@ fn scan_fn_decl(c: &mut Cursor<'_>, idx: &mut FileIndex, self_ty: Option<String>
         let bs = c.pos; c.skip_balanced("{", "}");
         idx.fns.push(FnItem { name, short_name: raw, sig_pos, body: (bs + 1, c.pos.saturating_sub(1)), meta, self_ty, is_test, is_async, is_unsafe, vis, in_generic_impl, in_mod });
     } else { let _ = c.eat_sym(";"); } }
-fn scan_items(c: &mut Cursor<'_>, idx: &mut FileIndex, self_ty: Option<&str>, impl_test: bool, in_generic_impl: bool, in_mod: bool) {
+fn scan_items(c: &mut Cursor<'_>, idx: &mut FileIndex, self_ty: Option<&str>, impl_test: bool, in_generic_impl: bool, in_mod: bool, depth: u16) {
+    if depth >= MAX_AST_DEPTH { c.skip_rest_of_braces(); return; }
     let (mut pending, mut is_test, mut is_async, mut is_unsafe, mut vis) = (FnMeta::default(), false, false, false, 0u8);
     while let Some(tok) = c.peek() {
         if (self_ty.is_some() || in_mod) && matches!(tok, Tok::Sym("}")) { c.pos += 1; break; }
@@ -319,10 +324,10 @@ fn scan_items(c: &mut Cursor<'_>, idx: &mut FileIndex, self_ty: Option<&str>, im
                         Tok::Ident(k) if k == "where" => { c.skip_until("{", ";", false); break; }
                         Tok::Ident(k) if !matches!(k.as_str(), "dyn" | "mut" | "const") => { if ty_name.is_none() || after_for { ty_name = Some(k.clone()); } c.pos += 1; }
                         Tok::Sym("<") => c.skip_angles(), Tok::Sym("(") => c.skip_balanced("(", ")"), _ => c.pos += 1, } }
-                if let (Some(tn), true) = (ty_name, c.eat_sym("{")) { scan_items(c, idx, Some(&tn), impl_test || it, ig, in_mod); } else { c.skip_item_body(); } }
+                if let (Some(tn), true) = (ty_name, c.eat_sym("{")) { scan_items(c, idx, Some(&tn), impl_test || it, ig, in_mod, depth + 1); } else { c.skip_item_body(); } }
             Tok::Ident(w) if w == "mod" && self_ty.is_none() => {
                 c.pos += 1; let mt = std::mem::take(&mut is_test); c.skip_until("{", ";", false);
-                if c.eat_sym("{") { scan_items(c, idx, None, impl_test || mt, false, true); } else { let _ = c.eat_sym(";"); }
+                if c.eat_sym("{") { scan_items(c, idx, None, impl_test || mt, false, true, depth + 1); } else { let _ = c.eat_sym(";"); }
                 reset = true; }
             Tok::Ident(w) if w == "trait" && self_ty.is_none() => { c.pos += 1; c.skip_item_body(); reset = true; }
             Tok::Ident(w) if w == "fn" => {
@@ -331,7 +336,7 @@ fn scan_items(c: &mut Cursor<'_>, idx: &mut FileIndex, self_ty: Option<&str>, im
             Tok::Sym("{") => { c.skip_balanced("{", "}"); reset = true; }
             _ => { c.pos += 1; reset = true; } }
         if reset { (pending, is_test, is_async, is_unsafe, vis) = (FnMeta::default(), false, false, false, 0); } } }
-pub(crate) fn scan_file(toks: &[Tok]) -> FileIndex { let (mut c, mut idx) = (Cursor { toks, pos: 0 }, FileIndex::default()); scan_items(&mut c, &mut idx, None, false, false, false); idx }
+pub(crate) fn scan_file(toks: &[Tok]) -> FileIndex { let (mut c, mut idx) = (Cursor { toks, pos: 0 }, FileIndex::default()); scan_items(&mut c, &mut idx, None, false, false, false, 0); idx }
 #[derive(Clone, Copy, Debug)]
 struct BufBind {
     id: u8, base_const: usize, base_node: Option<usize>, len_const: usize, len_node: Option<usize>,
@@ -363,9 +368,12 @@ fn bin_prec(sym: &str) -> Option<u8> {
     match sym { "||" => Some(1), "&&" => Some(2), "==" | "!=" | "<" | "<=" | ">" | ">=" => Some(3), "|" => Some(4), "^" => Some(5), "&" => Some(6), "<<" | ">>" => Some(7), "+" | "-" => Some(8), "*" | "/" | "%" => Some(9), _ => None } }
 struct LowerCtx<'a> {
     prog: Program, poc_params: Vec<PocParam>, vars: BTreeMap<String, Val>, mut_refs: BTreeSet<String>, stores: Vec<usize>, cur_guard: Option<(usize, bool)>,
-    early_rets: Vec<(usize, Val)>, file: &'a FileIndex, toks: &'a [Tok], depth: u8, loop_depth: u8, in_loop: bool, inlined_fns: &'a mut BTreeSet<String>,
+    early_rets: Vec<(usize, Val)>, file: &'a FileIndex, toks: &'a [Tok], depth: u8, ast_depth: u16, loop_depth: u8, in_loop: bool, inlined_fns: &'a mut BTreeSet<String>,
     next_region: u16, self_ty: Option<String>, no_struct_lit: bool, returns_opt: bool, is_async: bool, has_opaque: bool, utf8: Utf8State, }
 impl<'a> LowerCtx<'a> {
+    fn with_ast_depth<T>(&mut self, f: impl FnOnce(&mut Self) -> Option<T>) -> Option<T> {
+        if self.ast_depth >= MAX_AST_DEPTH { return None; }
+        self.ast_depth += 1; let r = f(self); self.ast_depth -= 1; r }
     fn push_g(&mut self, op: IrOp) -> usize { self.prog.push_guarded(op, self.cur_guard) }
     fn mk_bool(&mut self, c: usize, pol: bool) -> usize { if pol { c } else { let z = self.prog.push(Op::Const(0)); self.prog.push(Op::Cmp(CmpKind::Eq, c, z)) } }
     fn and_guard(&mut self, old: Option<(usize, bool)>, add: (usize, bool)) -> Option<(usize, bool)> {
@@ -535,7 +543,7 @@ impl<'a> LowerCtx<'a> {
                 Some(Val::Scalar(res, lt)) }
             _ => None, } }
     fn parse_expr_head(&mut self, c: &mut Cursor<'_>) -> Option<Val> { let p = self.no_struct_lit; self.no_struct_lit = true; let r = self.parse_expr(c); self.no_struct_lit = p; r }
-    fn parse_expr(&mut self, c: &mut Cursor<'_>) -> Option<Val> { self.parse_binop(c, 1) }
+    fn parse_expr(&mut self, c: &mut Cursor<'_>) -> Option<Val> { self.with_ast_depth(|this| this.parse_binop(c, 1)) }
     fn parse_binop(&mut self, c: &mut Cursor<'_>, min_p: u8) -> Option<Val> {
         let mut lv = self.parse_cast(c)?;
         while let Some(&Tok::Sym(op)) = c.peek() {
@@ -560,6 +568,8 @@ impl<'a> LowerCtx<'a> {
             }; val = Val::Scalar(nv, Some(dst)); }
         Some(val) }
     fn parse_unary(&mut self, c: &mut Cursor<'_>) -> Option<Val> {
+        self.with_ast_depth(|this| this.parse_unary_inner(c)) }
+    fn parse_unary_inner(&mut self, c: &mut Cursor<'_>) -> Option<Val> {
         if c.eat_sym("-") {
             if let Some(&Tok::Int(v, ty)) = c.peek() { c.pos += 1; return Some(Val::Scalar(self.prog.push(Op::Const(v.checked_neg()?)), ty)); }
             let rv = self.parse_unary(c)?; let ((r, rty), z) = (scalar_id(&rv)?, self.prog.push(Op::Const(0))); let res = self.push_g(Op::Sub(z, r));
@@ -1006,6 +1016,8 @@ impl<'a> LowerCtx<'a> {
         for (cond, ev) in callee_early.into_iter().rev() { val = self.merge_val(cond, ev, val, self.cur_guard)?; }
         Some(val) }
     fn bind_pat(&mut self, c: &mut Cursor<'_>, val: Val) -> Option<()> {
+        self.with_ast_depth(|this| this.bind_pat_inner(c, val)) }
+    fn bind_pat_inner(&mut self, c: &mut Cursor<'_>, val: Val) -> Option<()> {
         if c.eat_sym("(") {
             let Val::Tuple(xs) = val else { return None; }; let mut i = 0usize;
             while !c.eat_sym(")") { let _ = c.eat_ident("mut"); let v = xs.get(i)?.clone(); i += 1; self.bind_pat(c, v)?; let _ = c.eat_sym(","); }
@@ -1017,6 +1029,8 @@ impl<'a> LowerCtx<'a> {
         let cond = match inner_c { Some(ic) => { let z = self.prog.push(Op::Const(0)); self.push_g(Op::Select { cond: is_some, t_val: ic, f_val: z }) } None => is_some };
         Some((cond, inner_b)) }
     fn parse_if(&mut self, c: &mut Cursor<'_>) -> Option<(Option<Val>, bool)> {
+        self.with_ast_depth(|this| this.parse_if_inner(c)) }
+    fn parse_if_inner(&mut self, c: &mut Cursor<'_>) -> Option<(Option<Val>, bool)> {
         let (old_g, vars0) = (self.cur_guard, self.vars.clone());
         let (cond, opt_bind, opt_var) = if c.eat_ident("let") {
             let tag = c.expect_ident()?; if !matches!(tag.as_str(), "Some" | "Ok") || !c.eat_sym("(") { return None; }
@@ -1047,6 +1061,8 @@ impl<'a> LowerCtx<'a> {
             (Some(tt), _, false, true) => Some(tt), (_, Some(ft), true, false) => Some(ft), _ => None, };
         Some((val, t_ret && f_ret)) }
     fn parse_match_pat(&mut self, scrut: &Val, c: &mut Cursor<'_>) -> Option<PatMatch> {
+        self.with_ast_depth(|this| this.parse_match_pat_inner(scrut, c)) }
+    fn parse_match_pat_inner(&mut self, scrut: &Val, c: &mut Cursor<'_>) -> Option<PatMatch> {
         let (mut cond, mut bind, mut unconditional): (Option<usize>, Option<(String, Val)>, bool) = (None, None, false);
         loop {
             let piece = match c.peek()? {
@@ -1069,10 +1085,10 @@ impl<'a> LowerCtx<'a> {
                     } else if let Some(&(cv, _)) = self.file.consts.get(&nm) { let (sv, _) = scalar_id(scrut)?; let k = self.prog.push(Op::Const(cv)); Some(self.push_g(Op::Cmp(CmpKind::Eq, sv, k))) }
                     else { bind = Some((nm, scrut.clone())); unconditional = true; None } }
                 Tok::Sym("-") | Tok::Int(_, _) => {
-                    let (sv, _) = scalar_id(scrut)?; let lo = self.file.eval_const_atom(c, self.self_ty.as_deref())?.0;
+                    let (sv, _) = scalar_id(scrut)?; let lo = self.file.eval_const_atom(c, self.self_ty.as_deref(), self.ast_depth)?.0;
                     if c.eat_sym("..=") || c.eat_sym("..") {
                         let inc = matches!(c.toks.get(c.pos.saturating_sub(1)), Some(Tok::Sym("..=")));
-                        Some(self.in_bounds(sv, lo, self.file.eval_const_atom(c, self.self_ty.as_deref())?.0, inc))
+                        Some(self.in_bounds(sv, lo, self.file.eval_const_atom(c, self.self_ty.as_deref(), self.ast_depth)?.0, inc))
                     } else { let k = self.prog.push(Op::Const(lo)); Some(self.push_g(Op::Cmp(CmpKind::Eq, sv, k))) } }
                 _ => return None, };
             cond = if unconditional { None } else { match (cond, piece) { (None, p) => p, (c0, None) => c0, (Some(a), Some(b)) => { let one = self.prog.push(Op::Const(1)); Some(self.push_g(Op::Select { cond: a, t_val: one, f_val: b })) } } };
@@ -1223,6 +1239,8 @@ impl<'a> LowerCtx<'a> {
             self.cur_guard = self.and_guard(self.cur_guard, (cond_post, false)); self.apply_utf8_guard(cond_post, false, 0); }
         Some(()) }
     fn parse_block(&mut self, c: &mut Cursor<'_>) -> Option<(Vec<Val>, Option<Val>, bool)> {
+        self.with_ast_depth(|this| this.parse_block_inner(c)) }
+    fn parse_block_inner(&mut self, c: &mut Cursor<'_>) -> Option<(Vec<Val>, Option<Val>, bool)> {
         if !c.eat_sym("{") { return None; }
         let (mut rets, mut tail, mut returned) = (Vec::new(), None, false);
         while !c.eat_sym("}") {
@@ -1426,7 +1444,7 @@ fn lower_fn_item(item: &FnItem, file: &FileIndex, toks: &[Tok], inlined: &mut BT
     let mut prog = Program::new(&item.name); prog.simd_lanes = 1; prog.check_reg_budget = opts.enforce_reg_budget;
     let mut ctx = LowerCtx {
         prog, poc_params: Vec::new(), vars: BTreeMap::new(), mut_refs: BTreeSet::new(), stores: Vec::new(), cur_guard: None, early_rets: Vec::new(), file, toks,
-        depth: 0, loop_depth: 0, in_loop: false, inlined_fns: inlined, next_region: 1, self_ty: item.self_ty.clone(), no_struct_lit: false, returns_opt: false,
+        depth: 0, ast_depth: 0, loop_depth: 0, in_loop: false, inlined_fns: inlined, next_region: 1, self_ty: item.self_ty.clone(), no_struct_lit: false, returns_opt: false,
         is_async: item.is_async, has_opaque, utf8: Utf8State::default(),
     }; while !c.eat_sym(")") { lower_param(&mut ctx, &mut c, item)?; let _ = c.eat_sym(","); }
     ctx.returns_opt = validate_ret_ty(&mut c, file, item.self_ty.as_deref())?; let (rets, tail, _) = ctx.parse_block(&mut c)?; let mut final_val = tail.or_else(|| rets.into_iter().next());
@@ -1522,10 +1540,11 @@ fn is_ascii_pat(pat: &[Tok]) -> bool {
             if !ok { return false; }
             s = i + 1; } }
     any }
-fn ascii_guarded_expr<'a>(sl: &'a [Tok], preds: &BTreeSet<String>) -> Option<&'a [Tok]> {
+fn ascii_guarded_expr<'a>(sl: &'a [Tok], preds: &BTreeSet<String>, depth: u16) -> Option<&'a [Tok]> {
+    if depth >= MAX_AST_DEPTH { return None; }
     let sl = strip_parens(sl);
     if let Some(p) = find_top_sym(sl, "||") {
-        let (a, b) = (ascii_guarded_expr(sl.get(..p).unwrap_or(&[]), preds)?, ascii_guarded_expr(sl.get(p + 1..).unwrap_or(&[]), preds)?);
+        let (a, b) = (ascii_guarded_expr(sl.get(..p).unwrap_or(&[]), preds, depth + 1)?, ascii_guarded_expr(sl.get(p + 1..).unwrap_or(&[]), preds, depth + 1)?);
         return (strip_parens(a) == strip_parens(b)).then_some(a);
     }
     match sl {
@@ -1537,19 +1556,20 @@ fn ascii_guarded_expr<'a>(sl: &'a [Tok], preds: &BTreeSet<String>) -> Option<&'a
         [Tok::Ident(m), Tok::Sym("!"), Tok::Sym("("), rest @ .., Tok::Sym(")")] if m == "matches" && skip_bal(sl, 2, sl.len(), "(", ")") == sl.len() => find_top_sym(rest, ",").filter(|&cp| is_ascii_pat(rest.get(cp + 1..).unwrap_or(&[]))).and_then(|cp| rest.get(..cp)),
         [Tok::Sym("("), Tok::Int(lo, _), Tok::Sym(op @ ("..=" | "..")), Tok::Int(hi, _), Tok::Sym(")"), Tok::Sym("."), Tok::Ident(c), Tok::Sym("("), Tok::Sym("&"), x @ .., Tok::Sym(")")] if c == "contains" && !x.is_empty() && (0..128).contains(lo) && if *op == "..=" { (0..128).contains(hi) } else { (1..=128).contains(hi) } => Some(x),
         _ => None, } }
-fn is_ascii_byte_expr(sl: &[Tok], bvar: &str, preds: &BTreeSet<String>) -> bool {
+fn is_ascii_byte_expr(sl: &[Tok], bvar: &str, preds: &BTreeSet<String>, depth: u16) -> bool {
+    if depth >= MAX_AST_DEPTH { return false; }
     let sl = strip_parens(sl);
-    if let Some(p) = find_top_sym(sl, "||") { return is_ascii_byte_expr(sl.get(..p).unwrap_or(&[]), bvar, preds) && is_ascii_byte_expr(sl.get(p + 1..).unwrap_or(&[]), bvar, preds); }
-    if let Some(p) = find_top_sym(sl, "&&") { return is_ascii_byte_expr(sl.get(..p).unwrap_or(&[]), bvar, preds) || is_ascii_byte_expr(sl.get(p + 1..).unwrap_or(&[]), bvar, preds); }
-    ascii_guarded_expr(sl, preds).is_some_and(|x| matches!(strip_parens(x), [Tok::Ident(b)] if b == bvar)) }
+    if let Some(p) = find_top_sym(sl, "||") { return is_ascii_byte_expr(sl.get(..p).unwrap_or(&[]), bvar, preds, depth + 1) && is_ascii_byte_expr(sl.get(p + 1..).unwrap_or(&[]), bvar, preds, depth + 1); }
+    if let Some(p) = find_top_sym(sl, "&&") { return is_ascii_byte_expr(sl.get(..p).unwrap_or(&[]), bvar, preds, depth + 1) || is_ascii_byte_expr(sl.get(p + 1..).unwrap_or(&[]), bvar, preds, depth + 1); }
+    ascii_guarded_expr(sl, preds, depth).is_some_and(|x| matches!(strip_parens(x), [Tok::Ident(b)] if b == bvar)) }
 fn is_ascii_iter_pred(arg: &[Tok], preds: &BTreeSet<String>) -> bool {
     matches!(arg, [Tok::Ident(u), Tok::Sym("::"), Tok::Ident(f)] if u == "u8" && f.starts_with("is_ascii"))
-        || matches!(arg, [Tok::Sym("|"), Tok::Ident(b), Tok::Sym("|"), body @ ..] if is_ascii_byte_expr(body, b, preds))
+        || matches!(arg, [Tok::Sym("|"), Tok::Ident(b), Tok::Sym("|"), body @ ..] if is_ascii_byte_expr(body, b, preds, 0))
         || matches!(arg, [Tok::Ident(p)] if preds.contains(p)) }
 fn collect_ascii_byte_preds(file: &FileIndex, toks: &[Tok], out: &mut BTreeSet<String>) {
     for f in &file.fns {
         if f.self_ty.is_some() || f.in_mod { continue; }
-        if let Some((_, [(nm, [Tok::Ident(ty)])], _, body)) = fn_sig_params(f, toks).as_ref().map(|(s, p, r, b)| (*s, p.as_slice(), *r, *b)) { if ty == "u8" && is_ascii_byte_expr(body, nm, out) { out.insert(f.short_name.clone()); } }
+        if let Some((_, [(nm, [Tok::Ident(ty)])], _, body)) = fn_sig_params(f, toks).as_ref().map(|(s, p, r, b)| (*s, p.as_slice(), *r, *b)) { if ty == "u8" && is_ascii_byte_expr(body, nm, out, 0) { out.insert(f.short_name.clone()); } }
     } }
 #[derive(Clone, Debug)]
 pub(crate) struct BoundaryMorphism { bytes_param: usize, req_plus1: Option<usize>, req_ascii: Option<usize>, req_safe: Option<usize>, ret_opt: bool, ret_plus1: bool, ret_minus1: bool }
@@ -1557,12 +1577,13 @@ struct BmCtx<'a> {
     bn: &'a str, u8_p: BTreeMap<String, usize>, us_p: BTreeMap<String, usize>, preds: &'a BTreeSet<String>,
     quote_src: BTreeMap<String, usize>, base_param: BTreeMap<String, usize>,
     req_plus1: Option<usize>, req_ascii: Option<usize>, req_safe: Option<usize>,
-    ret_opt: bool, saw_val: bool, ret_plus1: bool, ret_minus1: bool, ok: bool, }
+    ret_opt: bool, saw_val: bool, ret_plus1: bool, ret_minus1: bool, ok: bool, depth: u16, }
 impl<'a> BmCtx<'a> {
     fn guard_byte_idx(&mut self, cond: &[Tok], out: &mut BTreeSet<String>) {
+        if self.depth >= MAX_AST_DEPTH { return; }
         let cond = strip_parens(cond);
-        if let Some(p) = find_top_sym(cond, "&&") { self.guard_byte_idx(cond.get(..p).unwrap_or(&[]), out); self.guard_byte_idx(cond.get(p + 1..).unwrap_or(&[]), out); return; }
-        if let Some([Tok::Ident(b), Tok::Sym("["), Tok::Ident(ix), Tok::Sym("]")]) = ascii_guarded_expr(cond, self.preds).map(strip_parens) { if b == self.bn { out.insert(ix.clone()); return; } }
+        if let Some(p) = find_top_sym(cond, "&&") { self.depth += 1; self.guard_byte_idx(cond.get(..p).unwrap_or(&[]), out); self.guard_byte_idx(cond.get(p + 1..).unwrap_or(&[]), out); self.depth -= 1; return; }
+        if let Some([Tok::Ident(b), Tok::Sym("["), Tok::Ident(ix), Tok::Sym("]")]) = ascii_guarded_expr(cond, self.preds, self.depth).map(strip_parens) { if b == self.bn { out.insert(ix.clone()); return; } }
         if let [Tok::Ident(b), Tok::Sym("["), Tok::Ident(ix), Tok::Sym("]"), Tok::Sym("=="), Tok::Ident(q)] = cond {
             if b == self.bn {
                 if let Some(&qp) = self.quote_src.get(q) { self.req_plus1 = Some(qp); out.insert(ix.clone()); }
@@ -1582,6 +1603,8 @@ impl<'a> BmCtx<'a> {
             [Tok::Ident(ix), Tok::Sym("+"), Tok::Int(1, _)] if ascii_at.contains(ix) => { self.ret_plus1 = false; }
             _ => self.ok = false, } }
     fn walk_block(&mut self, sl: &[Tok], safe: &mut BTreeSet<String>, ascii_at: &BTreeSet<String>, is_tail: bool) {
+        if self.depth >= MAX_AST_DEPTH { self.ok = false; return; }
+        self.depth += 1;
         let stmts = split_stmts(sl);
         for (si, &st) in stmts.iter().enumerate() {
             let tail = is_tail && si + 1 == stmts.len() && !matches!(sl.last(), Some(Tok::Sym(";")));
@@ -1626,7 +1649,8 @@ impl<'a> BmCtx<'a> {
                         else { self.walk_block(arms.get(as_..ae).unwrap_or(&[]), &mut safe.clone(), &aa, false); }
                         k = if matches!(arms.get(ae), Some(Tok::Sym(","))) { ae + 1 } else { ae }; } },
                 _ => if tail { self.check_ret(st, safe, ascii_at); }, }
-        } } }
+        }
+        self.depth -= 1; } }
 fn collect_boundary_morphisms(fidxs: &[FileIndex], all_toks: &[Vec<Tok>], preds: &BTreeSet<String>) -> BTreeMap<String, BoundaryMorphism> {
     let mut out: BTreeMap<String, BoundaryMorphism> = BTreeMap::new();
     for pass in 0..2 {
@@ -1650,7 +1674,7 @@ fn collect_boundary_morphisms(fidxs: &[FileIndex], all_toks: &[Vec<Tok>], preds:
                     continue; }
                 let u8_p = params.iter().enumerate().filter(|(_, (_, ty))| matches!(ty, [Tok::Ident(u)] if u == "u8")).map(|(i, (n, _))| (n.clone(), i)).collect();
                 let us_p = params.iter().enumerate().filter(|(_, (_, ty))| matches!(ty, [Tok::Ident(u)] if u == "usize")).map(|(i, (n, _))| (n.clone(), i)).collect();
-                let mut ctx = BmCtx { bn, u8_p, us_p, preds, quote_src: BTreeMap::new(), base_param: BTreeMap::new(), req_plus1: None, req_ascii: None, req_safe: None, ret_opt, saw_val: false, ret_plus1: true, ret_minus1: true, ok: true };
+                let mut ctx = BmCtx { bn, u8_p, us_p, preds, quote_src: BTreeMap::new(), base_param: BTreeMap::new(), req_plus1: None, req_ascii: None, req_safe: None, ret_opt, saw_val: false, ret_plus1: true, ret_minus1: true, ok: true, depth: 0 };
                 ctx.walk_block(body, &mut BTreeSet::new(), &BTreeSet::new(), true);
                 if ctx.ok && ctx.saw_val { out.insert(f.short_name.clone(), BoundaryMorphism { bytes_param: bp, req_plus1: ctx.req_plus1, req_ascii: ctx.req_ascii, req_safe: ctx.req_safe, ret_opt, ret_plus1: ctx.ret_plus1, ret_minus1: ctx.ret_minus1 }); }
             } } }
@@ -1672,7 +1696,7 @@ struct WitnessLattice {
     bytes_of: BTreeMap<String, String>, byte_var: BTreeMap<String, (String, String)>, char_of: BTreeMap<String, (String, String)>,
     rel_of: BTreeMap<String, (String, String, Option<i64>)>, sub_of: BTreeMap<String, (String, String)>,
     local_strs: BTreeMap<String, (usize, bool)>, local_ints: BTreeMap<String, i64>, safe_ranges: BTreeMap<String, String>,
-    opt_vars: BTreeSet<String>, poisoned: BTreeSet<String>, }
+    opt_vars: BTreeSet<String>, poisoned: BTreeSet<String>, depth: u16, }
 impl WitnessLattice {
     fn mark_safe(&mut self, recv: &str, var: &str, plus: Option<i64>, minus: Option<i64>) {
         self.poisoned.remove(var);
@@ -1730,16 +1754,17 @@ impl WitnessLattice {
                 core.iter().rposition(|t| matches!(t, Tok::Sym("."))).is_some_and(|dp| self.resolve_recv(core.get(..dp).unwrap_or(&[])).as_deref() == Some(recv) && matches!(core.get(dp + 1..), Some([Tok::Ident(m), Tok::Sym("("), needle, Tok::Sym(")")]) if (m == "find" || m == "rfind") && add_k.map_or(true, |k| self.str_lit_info(Some(needle), file).is_some_and(|(l, a, _)| a && l as i64 == k))))
             } } }
     fn apply_cond(&mut self, cond: &[Tok], truth: bool, uc: Utf8Ctx<'_>) {
+        if self.depth >= MAX_AST_DEPTH { return; }
         let cond = strip_parens(cond);
         if let Some(p) = find_top_sym(cond, "||") {
-            if !truth { self.apply_cond(cond.get(..p).unwrap_or(&[]), false, uc); self.apply_cond(cond.get(p + 1..).unwrap_or(&[]), false, uc); }
-            else if let Some(x) = ascii_guarded_expr(cond, uc.preds) { self.mark_ascii_expr(x); }
+            if !truth { self.depth += 1; self.apply_cond(cond.get(..p).unwrap_or(&[]), false, uc); self.apply_cond(cond.get(p + 1..).unwrap_or(&[]), false, uc); self.depth -= 1; }
+            else if let Some(x) = ascii_guarded_expr(cond, uc.preds, self.depth) { self.mark_ascii_expr(x); }
             return; }
-        if let Some(p) = find_top_sym(cond, "&&") { if truth { self.apply_cond(cond.get(..p).unwrap_or(&[]), true, uc); self.apply_cond(cond.get(p + 1..).unwrap_or(&[]), true, uc); } return; }
-        if let Some(p) = find_top_sym(cond, "!=") { if !truth { let mut eq = cond.get(..p).unwrap_or(&[]).to_vec(); eq.push(Tok::Sym("==")); eq.extend_from_slice(cond.get(p + 1..).unwrap_or(&[])); self.apply_cond(&eq, true, uc); } return; }
-        if matches!(cond.first(), Some(Tok::Sym("!"))) { self.apply_cond(cond.get(1..).unwrap_or(&[]), !truth, uc); return; }
+        if let Some(p) = find_top_sym(cond, "&&") { if truth { self.depth += 1; self.apply_cond(cond.get(..p).unwrap_or(&[]), true, uc); self.apply_cond(cond.get(p + 1..).unwrap_or(&[]), true, uc); self.depth -= 1; } return; }
+        if let Some(p) = find_top_sym(cond, "!=") { if !truth { let mut eq = cond.get(..p).unwrap_or(&[]).to_vec(); eq.push(Tok::Sym("==")); eq.extend_from_slice(cond.get(p + 1..).unwrap_or(&[])); self.depth += 1; self.apply_cond(&eq, true, uc); self.depth -= 1; } return; }
+        if matches!(cond.first(), Some(Tok::Sym("!"))) { self.depth += 1; self.apply_cond(cond.get(1..).unwrap_or(&[]), !truth, uc); self.depth -= 1; return; }
         if !truth { return; }
-        if let Some(x) = ascii_guarded_expr(cond, uc.preds) { self.mark_ascii_expr(x); }
+        if let Some(x) = ascii_guarded_expr(cond, uc.preds, self.depth) { self.mark_ascii_expr(x); }
         if let Some(p) = find_top_sym(cond, "==") {
             let (l, r) = (strip_parens(cond.get(..p).unwrap_or(&[])), strip_parens(cond.get(p + 1..).unwrap_or(&[])));
             for (a, b) in [(l, r), (r, l)] {
@@ -1768,9 +1793,11 @@ impl WitnessLattice {
                 "eq_ignore_ascii_case" => if let Some((l, true, _)) = self.str_lit_info(rest.first(), uc.file) { self.starts.entry(v.clone()).or_default().insert(l as i64); self.ascii_ok.insert(v.clone()); }
                 _ => {} },
             _ => {} } }
-    fn witness_of_expr(&self, rhs: &[Tok], uc: Utf8Ctx<'_>) -> Option<Witness> {
+    fn witness_of_expr(&self, rhs: &[Tok], uc: Utf8Ctx<'_>) -> Option<Witness> { self.witness_of_expr_d(rhs, uc, self.depth) }
+    fn witness_of_expr_d(&self, rhs: &[Tok], uc: Utf8Ctx<'_>, depth: u16) -> Option<Witness> {
+        if depth >= MAX_AST_DEPTH { return None; }
         let mut e = strip_parens(rhs);
-        if let [base @ .., Tok::Sym("+"), Tok::Int(k, _)] = e { return self.witness_of_expr(base, uc).and_then(|(r, bs, pk, _)| (pk == Some(*k)).then_some((r, bs, None, Some(*k)))); }
+        if let [base @ .., Tok::Sym("+"), Tok::Int(k, _)] = e { return self.witness_of_expr_d(base, uc, depth + 1).and_then(|(r, bs, pk, _)| (pk == Some(*k)).then_some((r, bs, None, Some(*k)))); }
         while matches!(e.last(), Some(Tok::Sym("?"))) { e = e.get(..e.len().saturating_sub(1)).unwrap_or(&[]); }
         if let Some(dp) = e.iter().rposition(|t| matches!(t, Tok::Sym("."))) {
             if let Some([Tok::Ident(m), Tok::Sym("("), ..]) = e.get(dp + 1..) {
@@ -1782,7 +1809,7 @@ impl WitnessLattice {
             if matches!(e.get(dp + 1..dp + 3), Some([Tok::Ident(m), Tok::Sym("(")]) if m == "map_or") && skip_bal(e, dp + 2, e.len(), "(", ")") == e.len() {
                 let args = split_top_commas(e.get(dp + 3..e.len().saturating_sub(1)).unwrap_or(&[]), false);
                 if let (Some(&[Tok::Int(0, _)]), Some(&[Tok::Sym("|"), Tok::Ident(ref cp), Tok::Sym("|"), ref cbody @ ..])) = (args.first(), args.get(1)) {
-                    if let Some((recv, base, pk, _)) = self.witness_of_expr(e.get(..dp).unwrap_or(&[]), uc) {
+                    if let Some((recv, base, pk, _)) = self.witness_of_expr_d(e.get(..dp).unwrap_or(&[]), uc, depth + 1) {
                         if matches!(strip_parens(cbody), [Tok::Ident(x)] if x == cp) || matches!(strip_parens(cbody), [Tok::Ident(x), Tok::Sym("+"), Tok::Int(k, _)] if x == cp && pk == Some(*k)) { return Some((recv, base, None, None)); } }
                 } } }
         if let [Tok::Ident(v), Tok::Sym("."), Tok::Ident(b), Tok::Sym("("), Tok::Sym(")"), Tok::Sym("."), Tok::Ident(tw), Tok::Sym("("), ..] = e {
@@ -1843,6 +1870,9 @@ impl WitnessLattice {
                 if self.safe_for.get(&r).is_some_and(|sf| sf.contains(rel)) { let pk = self.safe_plus.get(&r).and_then(|m| m.get(rel)).and_then(|ks| ks.iter().next().copied()); self.mark_safe(&r, dst, pk, None); } },
             _ => {} } }
     fn audit_expr(&mut self, sl: &[Tok], uc: Utf8Ctx<'_>, calls: &mut Option<&mut Vec<Utf8CallWitness>>) -> Result<(), VerifyError> {
+        if self.depth >= MAX_AST_DEPTH { return Err(VerifyError::Utf8CharBoundary { detail: "exceeded maximum AST nesting depth".into() }); }
+        self.depth += 1; let r = self.audit_expr_inner(sl, uc, calls); self.depth -= 1; r }
+    fn audit_expr_inner(&mut self, sl: &[Tok], uc: Utf8Ctx<'_>, calls: &mut Option<&mut Vec<Utf8CallWitness>>) -> Result<(), VerifyError> {
         let sl = strip_parens(sl);
         if let Some(p) = find_top_sym(sl, "&&") {
             let (l, r) = (sl.get(..p).unwrap_or(&[]), sl.get(p + 1..).unwrap_or(&[]));
@@ -1885,9 +1915,14 @@ impl WitnessLattice {
             i += 1; }
         Ok(()) }
     fn audit_block(&mut self, sl: &[Tok], uc: Utf8Ctx<'_>, calls: &mut Option<&mut Vec<Utf8CallWitness>>) -> Result<(), VerifyError> {
+        if self.depth >= MAX_AST_DEPTH { return Err(VerifyError::Utf8CharBoundary { detail: "exceeded maximum AST nesting depth".into() }); }
+        self.depth += 1; let r = self.audit_block_inner(sl, uc, calls); self.depth -= 1; r }
+    fn audit_block_inner(&mut self, sl: &[Tok], uc: Utf8Ctx<'_>, calls: &mut Option<&mut Vec<Utf8CallWitness>>) -> Result<(), VerifyError> {
         let diverges = |b: &[Tok]| split_stmts(b).last().is_some_and(|s| matches!(s.first(), Some(Tok::Ident(w)) if matches!(w.as_str(), "return" | "break" | "continue" | "panic" | "unreachable")));
         for st in split_stmts(sl) {
             match st.first() {
+                Some(Tok::Sym("{")) if skip_bal(st, 0, st.len(), "{", "}") == st.len() => {
+                    let mut bl = self.clone(); bl.audit_block(st.get(1..st.len().saturating_sub(1)).unwrap_or(&[]), uc, calls)?; self.merge_mut(&bl); }
                 Some(Tok::Ident(w)) if w == "const" => if let (Some(Tok::Ident(nm)), Some(eq)) = (st.get(1), find_top_sym(st, "=")) {
                     match st.get(eq + 1..) { Some(&[Tok::Str(l, a)]) => { self.local_strs.insert(nm.clone(), (l, a)); } Some(&[Tok::Int(v, _)]) => { self.local_ints.insert(nm.clone(), v); } _ => {} } },
                 Some(Tok::Ident(w)) if w == "let" => if let Some(eq) = find_top_sym(st, "=") {
@@ -1974,7 +2009,7 @@ fn run_utf8_audit(item: &FnItem, file: &FileIndex, toks: &[Tok], preds: &BTreeSe
     if lat.str_vars.is_empty() && lat.self_str_fields.is_empty() && calls.is_none() { return None; }
     lat.audit_block(body, Utf8Ctx { file, preds, morphs }, &mut calls).err() }
 pub(crate) fn audit_utf8_item(item: &FnItem, file: &FileIndex, toks: &[Tok], preds: &BTreeSet<String>, morphs: &BTreeMap<String, BoundaryMorphism>, init: &Utf8ParamInit) -> Option<VerifyError> { run_utf8_audit(item, file, toks, preds, morphs, init, None) }
-pub(crate) fn collect_utf8_call_witnesses(item: &FnItem, file: &FileIndex, toks: &[Tok], preds: &BTreeSet<String>, morphs: &BTreeMap<String, BoundaryMorphism>, init: &Utf8ParamInit) -> Vec<Utf8CallWitness> { let mut out = Vec::new(); let _ = run_utf8_audit(item, file, toks, preds, morphs, init, Some(&mut out)); out }
+pub(crate) fn collect_utf8_call_witnesses(item: &FnItem, file: &FileIndex, toks: &[Tok], preds: &BTreeSet<String>, morphs: &BTreeMap<String, BoundaryMorphism>, init: &Utf8ParamInit) -> Vec<Utf8CallWitness> { let mut out = Vec::new(); if run_utf8_audit(item, file, toks, preds, morphs, init, Some(&mut out)).is_some() { out.clear(); } out }
 fn parse_rust_with_poc_params(src: &str, opts: RustFeOptions) -> ParsedPocEntries {
     let (toks, mut entries, mut skipped_raw, mut inlined) = (tokenize_rust(src), Vec::new(), Vec::new(), BTreeSet::new()); let file = scan_file(&toks);
     for item in &file.fns {
