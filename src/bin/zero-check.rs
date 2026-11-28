@@ -1,15 +1,18 @@
 #![forbid(unsafe_code)]
 use std::{env, path::PathBuf, process::ExitCode, time::Instant};
-use zero_check::{promote_kernel_strict, run_gauntlet, scan_crate_dir_with_opts, verify_crate_functions_with_opts, verify_ntf1_file, ArchProfile, AutopoieticLedger, LintOptions, RefineConfig, RustFeOptions, Severity};
+use zero_check::{analyze_crate_perf, promote_kernel_strict, resolve_cpu_profile, run_gauntlet, run_zero_cc_bench, scan_crate_dir_with_opts, verify_crate_functions_with_opts, verify_ntf1_file, ArchProfile, AutopoieticLedger, LintOptions, PerfOptions, RefineConfig, RustFeOptions, Severity};
 struct CliArgs {
     targets: Vec<PathBuf>, ntf1_files: Vec<PathBuf>, skip: Vec<String>, ledger_path: Option<PathBuf>,
     emit_json: bool, quiet: bool, prove_fns: bool, kernel_strict: bool, require_totality: bool,
-    exclude_cfg_test: bool, audit_external: bool, no_callgraph: bool, emit_poc: bool, arch: ArchProfile, }
-const USAGE: &str = "usage: zero-check [--ledger <path>] [--no-ledger] [--ntf1 <file>] [--skip <file>] [--exclude-cfg-test] [--audit-external] [--no-callgraph] [--emit-poc] [--prove-fns] [--kernel-strict] [--require-totality] [--arch avx2|neon] [--emit-json] [--quiet] <target1> [target2 ...]";
+    exclude_cfg_test: bool, audit_external: bool, no_callgraph: bool, emit_poc: bool, arch: ArchProfile,
+    perf: bool, perf_strict: bool, perf_bench: bool, cpu: String, cpu_spec: Option<PathBuf>, }
+const USAGE: &str = "usage: zero-check [--ledger <path>] [--no-ledger] [--ntf1 <file>] [--skip <file>] [--exclude-cfg-test] [--audit-external] [--no-callgraph] [--emit-poc] [--prove-fns] [--kernel-strict] [--require-totality] [--arch avx2|neon] [--perf] [--perf-strict] [--perf-bench] [--cpu <profile|auto>] [--cpu-spec <path>] [--emit-json] [--quiet] <target1> [target2 ...]";
 fn parse_args() -> Result<CliArgs, String> {
     let (mut targets, mut ntf1_files, mut skip) = (Vec::new(), Vec::new(), Vec::new()); let mut ledger_path = Some(env::temp_dir().join("zero_check_ledger.json"));
     let (mut emit_json, mut quiet, mut prove_fns, mut kernel_strict, mut require_totality) = (false, false, false, false, false);
-    let (mut exclude_cfg_test, mut audit_external, mut no_callgraph, mut emit_poc) = (false, false, false, false); let mut arch = ArchProfile::X86_64Avx2; let mut it = env::args().skip(1);
+    let (mut exclude_cfg_test, mut audit_external, mut no_callgraph, mut emit_poc) = (false, false, false, false);
+    let (mut perf, mut perf_strict, mut perf_bench, mut cpu, mut cpu_spec) = (false, false, false, "auto".to_string(), None);
+    let mut arch = ArchProfile::X86_64Avx2; let mut it = env::args().skip(1);
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "--json" | "--ledger" => ledger_path = Some(PathBuf::from(it.next().ok_or_else(|| format!("{arg} requires a file path"))?)),
@@ -25,6 +28,11 @@ fn parse_args() -> Result<CliArgs, String> {
             "--prove-fns" => prove_fns = true,
             "--kernel-strict" => { kernel_strict = true; audit_external = false; prove_fns = true; }
             "--require-totality" => { require_totality = true; prove_fns = true; }
+            "--perf" => perf = true,
+            "--perf-strict" => { perf = true; perf_strict = true; }
+            "--perf-bench" => { perf = true; perf_bench = true; }
+            "--cpu" => cpu = it.next().ok_or_else(|| "--cpu requires a profile name or auto".to_string())?,
+            "--cpu-spec" => cpu_spec = Some(PathBuf::from(it.next().ok_or_else(|| "--cpu-spec requires a file path".to_string())?)),
             "--no-ledger" => ledger_path = None,
             "--emit-json" => emit_json = true,
             "--quiet" | "-q" => quiet = true,
@@ -33,7 +41,7 @@ fn parse_args() -> Result<CliArgs, String> {
             path => { let pb = PathBuf::from(path); if pb.extension().and_then(|s| s.to_str()) == Some("ntf1") { ntf1_files.push(pb); } else { targets.push(pb); } }
         } }
     if targets.is_empty() && ntf1_files.is_empty() { return Err(USAGE.to_string()); }
-    Ok(CliArgs { targets, ntf1_files, skip, ledger_path, emit_json, quiet, prove_fns, kernel_strict, require_totality, exclude_cfg_test, audit_external, no_callgraph, emit_poc, arch }) }
+    Ok(CliArgs { targets, ntf1_files, skip, ledger_path, emit_json, quiet, prove_fns, kernel_strict, require_totality, exclude_cfg_test, audit_external, no_callgraph, emit_poc, arch, perf, perf_strict, perf_bench, cpu, cpu_spec }) }
 fn main() -> ExitCode {
     let args = match parse_args() { Ok(a) => a, Err(msg) => { eprintln!("{msg}"); return ExitCode::from(2); } }; let t0 = Instant::now();
     let mut ledger = args.ledger_path.as_ref().map_or_else(AutopoieticLedger::default, |p| AutopoieticLedger::load_or_new(p));
@@ -62,6 +70,23 @@ fn main() -> ExitCode {
                 crate_invariants.push(format!("ntf1:{} +t={} -t={} 0t={} |>={} faults={}", nf.display(), rep.forward_count, rep.retro_count, rep.airlock_count, rep.pipe_count, rep.faults_covered));
                 ntf1_rows.push((nf.display().to_string(), rep)); }
             Err(e) => { total_errors += 1; eprintln!("[ZERO-CHECK-NTF1-ERR] {}: {e}", nf.display()); } } }
+    let mut perf_reports = Vec::new();
+    if args.perf {
+        let (cpu_prof, all_profs) = match resolve_cpu_profile(&args.cpu, args.cpu_spec.as_deref()) {
+            Ok(v) => v,
+            Err(e) => { eprintln!("[ZERO-CHECK-PERF-ERR] {e}"); return ExitCode::from(2); }
+        };
+        let popts = PerfOptions { exclude_cfg_test: true };
+        for dir in &args.targets {
+            let mut prep = match analyze_crate_perf(dir, &args.skip, &cpu_prof, &all_profs, popts) {
+                Ok(r) => r,
+                Err(e) => { eprintln!("[ZERO-CHECK-PERF-ERR] {}: {e}", dir.display()); return ExitCode::from(1); }
+            };
+            if args.perf_bench { prep.bench_telemetry = run_zero_cc_bench(dir, &cpu_prof, args.cpu_spec.as_deref()); }
+            if args.perf_strict { total_errors += prep.high_count(); }
+            perf_reports.push((dir.display().to_string(), prep));
+        }
+    }
     let gauntlet = run_gauntlet(); let mut all_invariants = crate_invariants;
     all_invariants.extend(gauntlet.proven_invariants.clone()); ledger.crates_verified = args.targets.len(); ledger.files_scanned = total_files; ledger.lines_scanned = total_lines;
     ledger.lint_errors = total_errors; ledger.lint_warnings = total_warnings; ledger.gauntlet_passed = gauntlet.checks_passed; ledger.gauntlet_total = gauntlet.checks_total;
@@ -86,6 +111,7 @@ fn main() -> ExitCode {
                 if args.emit_poc { if let Some(poc) = &f.poc_test { println!("{poc}"); } } }
             if args.require_totality && !r.skipped_non_kernel_fns.is_empty() { eprintln!("  FN-SKIP-FAIL {}: {:?}", r.file, r.skipped_non_kernel_fns); } }
         for fail in &gauntlet.failures { eprintln!("  GAUNTLET-FAIL: {fail}"); }
+        for (path, prep) in &perf_reports { print!("[PERF-TARGET] {path}\n{}", prep.format_report(10)); }
         let lp_str = args.ledger_path.as_ref().map_or_else(|| "none".to_string(), |p| p.display().to_string());
         println!("[ZERO-CHECK-V2] crates={} files={} loc={} errors={} warnings={} gauntlet={}/{} invariants={} guards={} epoch={} wall={:.3} ms ({} us) ledger={}",
             ledger.crates_verified, ledger.files_scanned, ledger.lines_scanned, ledger.lint_errors, ledger.lint_warnings,
